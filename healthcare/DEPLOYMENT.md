@@ -129,10 +129,9 @@ end to end.
 
 Two distinct pieces of SIP, easy to conflate:
 
-- **Inbound** — a number that rings the agent. Needs a SIP trunk from a
-  provider (Twilio, Telnyx…), an inbound trunk in LiveKit, and a dispatch rule
-  routing calls into a room the agent serves. None of the three env vars above
-  are involved.
+- **Inbound** — a number that rings the agent. With a LiveKit Phone Number this
+  is just a dispatch rule (above); with a third-party number you also need an
+  inbound trunk carrying it. None of the three env vars above are involved.
 - **Outbound** — the warm transfer to a human. This is what the variables
   configure, and it needs an *outbound* trunk plus a real supervisor number.
 
