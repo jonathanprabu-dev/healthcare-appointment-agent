@@ -70,7 +70,8 @@ Scenarios, all verified end-to-end against live inference:
 | `billing` | auth fast-path -> balance lookup | always (read-only) |
 | `transfer` | out-of-scope medical question -> `transfer_to_human` | always (read-only) |
 
-Other flags: `--verbose` (livekit DEBUG logs), `--turn-timeout` (default 120s).
+Other flags: `--verbose` (livekit DEBUG logs), `--turn-timeout` (default 120s),
+`--db PATH` (see Database below).
 
 The `schedule` exit code is a real smoke-test signal — it checks the booking,
 not just that some field changed. It prints its own verdict:
@@ -98,6 +99,38 @@ A passing `schedule` run ends with, on Mary Jane:
 ```
 
 and Dr. Henry Jekyll down from 3 availability slots to 2.
+
+### Database
+
+Two interchangeable backends behind one interface:
+
+- `fake_database.py` — in-memory, reseeded per process. The default.
+- `sqlite_database.py` — same twelve methods, persists to a file.
+
+`entrypoint()` picks by env var: `CLINIC_DB=clinic.db uv run agent.py console`
+uses SQLite; unset, it uses the fake. The driver takes `--db PATH` instead.
+
+**Use a throwaway path with the driver.** `schedule` asserts an unconsumed slot
+exists, so re-running against the same file fails the second time — the slot is
+already booked. Verified working:
+
+```bash
+PYTHONUTF8=1 uv run .claude/skills/run-healthcare-agent/driver.py     --scenario schedule --db "$(mktemp -d)/clinic.db"
+```
+
+After any change to either backend, run the parity check (no LLM, no network,
+no credentials, ~1s):
+
+```bash
+uv run test_sqlite_parity.py
+```
+
+It drives both backends through the same operations and diffs the results,
+including two **intentional** divergences it asserts rather than hides:
+FakeDatabase leaves an empty `appointments` key behind after a cancel while
+SQLite omits it (`agent.py` reads it via `.get("appointments", [])` either
+way), and SQLite returns availability in chronological order where the fake
+appends a restored slot at the end.
 
 ### Writing a new scenario
 
@@ -166,6 +199,12 @@ as `registered worker`, not through an actual browser session.
 - **Run everything from `healthcare/`.** `agent.py` does a top-level
   `from fake_database import FakeDatabase`; the driver compensates with
   `sys.path.insert(0, ".")`, which still assumes that cwd.
+- **`add_appointment` is one transaction** in `sqlite_database.py`: it inserts
+  the appointment and deletes the doctor's availability slot together. Split
+  them and a crash in between double-books the doctor.
+- **The database interface is synchronous** and all 16 call sites in `agent.py`
+  assume it. Keep it that way — an async driver (asyncpg) turns every one of
+  them into an `await`, including the ones inside `@function_tool` bodies.
 - **Python is pinned to 3.13** in `.python-version`. The `livekit-plugins-silero`
   dependency pulls `onnxruntime`, which is not a safe bet on 3.14; uv fetches a
   managed 3.13 automatically.

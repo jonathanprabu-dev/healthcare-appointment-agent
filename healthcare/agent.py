@@ -9,6 +9,7 @@ from typing import Annotated
 from dotenv import load_dotenv
 from fake_database import FakeDatabase
 from pydantic import Field
+from sqlite_database import SqliteDatabase
 
 from livekit.agents import (
     Agent,
@@ -43,6 +44,15 @@ load_dotenv()
 SIP_TRUNK_ID = os.getenv("LIVEKIT_SIP_OUTBOUND_TRUNK")  # "ST_abcxyz"
 SUPERVISOR_PHONE_NUMBER = os.getenv("LIVEKIT_SUPERVISOR_PHONE_NUMBER")  # "+12003004000"
 SIP_NUMBER = os.getenv("LIVEKIT_SIP_NUMBER")  # "+15005006000" - caller ID shown to supervisor
+
+# Set CLINIC_DB to a file path to persist across sessions (SqliteDatabase);
+# unset, the in-memory FakeDatabase is used and every session starts fresh.
+CLINIC_DB = os.getenv("CLINIC_DB")
+
+
+def make_database():
+    """The database backing a session: SQLite when CLINIC_DB is set, else fake."""
+    return SqliteDatabase(CLINIC_DB) if CLINIC_DB else FakeDatabase()
 
 VALID_INSURANCES = ["Anthem", "Aetna", "EmblemHealth", "HealthFirst"]
 
@@ -752,7 +762,7 @@ server = AgentServer()
 
 @server.rtc_session()
 async def entrypoint(ctx: JobContext):
-    db = FakeDatabase()
+    db = make_database()
     userdata = UserData(database=db, profile=None)
     session = AgentSession(
         userdata=userdata,

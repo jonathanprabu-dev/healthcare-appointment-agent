@@ -27,6 +27,7 @@ sys.path.insert(0, ".")  # agent.py does a top-level `from fake_database import 
 
 from agent import HealthcareAgent, UserData  # noqa: E402
 from fake_database import FakeDatabase  # noqa: E402
+from sqlite_database import SqliteDatabase  # noqa: E402
 
 from livekit.agents import AgentSession, inference  # noqa: E402
 
@@ -119,11 +120,19 @@ async def main() -> int:
     ap.add_argument("--scenario", choices=sorted(SCENARIOS), default="schedule")
     ap.add_argument("--turn-timeout", type=float, default=120.0)
     ap.add_argument("--verbose", action="store_true", help="show livekit DEBUG logs")
+    ap.add_argument(
+        "--db",
+        metavar="PATH",
+        help="run against SqliteDatabase at PATH instead of the in-memory "
+        "FakeDatabase. Use a throwaway path: the schedule assertions expect "
+        "unconsumed availability, so a reused file fails on the second run.",
+    )
     args = ap.parse_args()
 
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.WARNING)
 
-    db = FakeDatabase()
+    db = SqliteDatabase(args.db) if args.db else FakeDatabase()
+    print(f"database: {type(db).__name__}({args.db or 'in-memory'})", flush=True)
     # Same wiring as entrypoint() in agent.py, minus STT/TTS (text only) and
     # minus the user_state_changed idle-nudge (no audio => no "away" state).
     session = AgentSession(
