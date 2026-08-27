@@ -1,0 +1,13 @@
+# Reference clone of livekit/agents — not our code, re-clone as needed
+agents/
+
+# Remember-plugin session history
+.remember/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Secrets
+.env
