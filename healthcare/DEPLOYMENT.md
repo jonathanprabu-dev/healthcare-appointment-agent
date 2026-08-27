@@ -61,10 +61,57 @@ unlikely to reach it; it is the number to watch if it grows.
 
 ## 2. Telephony
 
-**Not verified at all.** The LiveKit CLI (`lk`) is not installed on this
-machine, and inbound calls need a purchased phone number, so nothing in this
-section has been executed. Treat it as a checklist against LiveKit's SIP
-documentation (`docs.livekit.io/sip/`), not as a tested runbook.
+**Partly done, one step blocked.** `lk` 2.18.3 is installed and a number is
+purchased. Current state on the project:
+
+| Thing | ID | State |
+|---|---|---|
+| Phone number | `PN_PPN_QwQP3U5s6VWc` (+1 484-295-1233) | ACTIVE, **no dispatch rule assigned** |
+| Dispatch rule | `SDR_CMDNYY2FKGXb` | individual, `call-` prefix, agent `healthcare-agent` |
+| Inbound trunk | — | none, and none is needed |
+
+LiveKit Phone Numbers need **no SIP trunk** — only a dispatch rule
+(`docs.livekit.io/telephony/start/phone-numbers/`). A trunk was created during
+setup on a wrong hunch and deleted again; do not recreate one.
+
+The rule is defined by `sip-dispatch-rule.json`, applied with:
+
+```bash
+set -a && . ./.env && set +a
+lk sip dispatch create sip-dispatch-rule.json
+```
+
+Because the rule names an agent, the worker must run under that name —
+no code change needed:
+
+```bash
+LIVEKIT_AGENT_NAME=healthcare-agent CLINIC_DB=clinic.db uv run agent.py dev
+```
+
+Note the tradeoff: naming the agent switches it to **explicit dispatch**, so it
+stops picking up rooms automatically. Leave `LIVEKIT_AGENT_NAME` unset for
+browser/playground testing.
+
+**The blocked step** is assigning the number to the rule. The documented
+command fails against the API:
+
+```
+lk number update --id PN_PPN_QwQP3U5s6VWc --sip-dispatch-rule-id SDR_CMDNYY2FKGXb
+twirp error invalid_argument: twirp error unknown: Failed to update phone number
+```
+
+Tried and ruled out: `--number` instead of `--id`; before and after the number
+went ACTIVE; with and without an inbound trunk; with a rule that names an agent
+and one that does not. `--curl` shows a well-formed request —
+`{"id":"PN_PPN_...","sipDispatchRuleId":"SDR_..."}` to
+`PhoneNumberService/UpdatePhoneNumber` — so the payload is not the problem. Do
+it in the **Cloud dashboard** instead: Telephony → Phone Numbers → ⋮ →
+*Assign dispatch rule*. Until it is assigned, calls to the number reach
+nothing.
+
+Warm transfer is a separate, still-unconfigured path (see below); note that
+LiveKit Phone Numbers are **inbound only**, so a transfer needs a trunk from
+another provider.
 
 What *is* verified is the code side — these environment variables are read by
 `agent.py` and nothing else has to change to use them:

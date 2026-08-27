@@ -1,0 +1,17 @@
+{
+  "dispatch_rule": {
+    "name": "healthcare-inbound",
+    "rule": {
+      "dispatchRuleIndividual": {
+        "roomPrefix": "call-"
+      }
+    },
+    "roomConfig": {
+      "agents": [
+        {
+          "agentName": "healthcare-agent"
+        }
+      ]
+    }
+  }
+}
