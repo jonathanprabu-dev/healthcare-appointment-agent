@@ -1,0 +1,163 @@
+"""Concurrency test: concurrent sessions must never see "database is locked".
+
+The agent opens one SqliteDatabase per session. LiveKit runs jobs as threads on
+Windows and as separate processes on Linux, so both shapes are exercised here
+against a single database file.
+
+    uv run test_sqlite_concurrency.py
+
+The control case at the end deliberately disables busy_timeout to show the
+failure this configuration prevents — if the control stops failing, the test
+has stopped proving anything.
+"""
+
+from __future__ import annotations
+
+import multiprocessing
+import sqlite3
+import sys
+import tempfile
+import threading
+from datetime import date, datetime, time, timedelta
+from pathlib import Path
+
+from sqlite_database import SqliteDatabase
+
+WORKERS = 8
+BOOKINGS_PER_WORKER = 25
+
+FAILURES: list[str] = []
+
+
+def check(label: str, expected: object, actual: object) -> None:
+    if expected == actual:
+        print(f"  ok   {label}")
+    else:
+        FAILURES.append(label)
+        print(f"  FAIL {label}\n       expected: {expected!r}\n       actual:   {actual!r}")
+
+
+def _book(path: str, worker: int, count: int, results: list) -> None:
+    """One session's worth of writes: its own connection, like entrypoint()."""
+    db = SqliteDatabase(path)
+    try:
+        for i in range(count):
+            # Distinct slot per write, so nothing serializes on the same row.
+            slot = datetime.combine(date(2030, 1, 1), time(0, 0)) + timedelta(
+                minutes=worker * 1000 + i
+            )
+            db.add_appointment(
+                "Mary Jane",
+                {
+                    "doctor_name": f"Dr. Worker {worker}",
+                    "appointment_time": slot,
+                    "visit_reason": "load",
+                },
+            )
+            db.apply_payment("Mary Jane", 0.01)
+        results.append(None)
+    except Exception as exc:  # noqa: BLE001 - the point is to catch lock errors
+        results.append(f"worker {worker}: {type(exc).__name__}: {exc}")
+    finally:
+        db.close()
+
+
+def _book_process(path: str, worker: int, count: int, queue) -> None:  # noqa: ANN001
+    results: list = []
+    _book(path, worker, count, results)
+    queue.put(results[0])
+
+
+def run_threads(path: str) -> list:
+    results: list = []
+    threads = [
+        threading.Thread(target=_book, args=(path, w, BOOKINGS_PER_WORKER, results))
+        for w in range(WORKERS)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    return [r for r in results if r is not None]
+
+
+def run_processes(path: str) -> list:
+    queue: multiprocessing.Queue = multiprocessing.Queue()
+    procs = [
+        multiprocessing.Process(target=_book_process, args=(path, w, BOOKINGS_PER_WORKER, queue))
+        for w in range(WORKERS)
+    ]
+    for p in procs:
+        p.start()
+    for p in procs:
+        p.join()
+    errors = [queue.get() for _ in procs if not queue.empty()]
+    return [e for e in errors if e is not None]
+
+
+def _control_no_busy_timeout(path: str, worker: int, results: list) -> None:
+    """Same writes, but with busy_timeout at its 0ms default."""
+    con = sqlite3.connect(path, check_same_thread=False)
+    try:
+        con.execute("PRAGMA busy_timeout=0")
+        for i in range(BOOKINGS_PER_WORKER):
+            with con:
+                con.execute(
+                    "INSERT INTO appointments (patient_id, doctor_name, appointment_time,"
+                    " visit_reason) SELECT id, ?, ?, 'control' FROM patients WHERE name = ?",
+                    (f"Dr. Control {worker}", f"2031-01-0{worker % 9 + 1}T0{i % 9}:00:00",
+                     "Mary Jane"),
+                )
+        results.append(None)
+    except Exception as exc:  # noqa: BLE001
+        results.append(f"{type(exc).__name__}: {exc}")
+    finally:
+        con.close()
+
+
+def main() -> int:
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        path = str(Path(tmp) / "clinic.db")
+        SqliteDatabase(path, seed=True).close()
+
+        print(f"\n{WORKERS} concurrent threads x {BOOKINGS_PER_WORKER} bookings (Windows shape)")
+        check("no errors", [], run_threads(path))
+
+        print(f"\n{WORKERS} concurrent processes x {BOOKINGS_PER_WORKER} bookings (Linux shape)")
+        check("no errors", [], run_processes(path))
+
+        con = sqlite3.connect(path)
+        written = con.execute("SELECT COUNT(*) FROM appointments").fetchone()[0]
+        check("every write landed", WORKERS * BOOKINGS_PER_WORKER * 2, written)
+        check("journal_mode", "wal", con.execute("PRAGMA journal_mode").fetchone()[0])
+        con.close()
+
+    print("\ncontrol: same load with busy_timeout=0")
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        path = str(Path(tmp) / "control.db")
+        SqliteDatabase(path, seed=True).close()
+        results: list = []
+        threads = [
+            threading.Thread(target=_control_no_busy_timeout, args=(path, w, results))
+            for w in range(WORKERS)
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        locked = [r for r in results if r and "locked" in r]
+        if locked:
+            print(f"  ok   busy_timeout=0 fails as expected: {locked[0]}")
+        else:
+            print("  WARN control did not hit a lock; it proves nothing on this machine")
+
+    print()
+    if FAILURES:
+        print(f"FAILED: {len(FAILURES)} check(s): {FAILURES}")
+        return 1
+    print("all checks passed")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

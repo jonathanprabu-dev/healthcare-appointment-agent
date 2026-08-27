@@ -121,11 +121,12 @@ The fixtures are two fictional patients and two fictional doctors; a
 deployment must not invent patient records on first boot. Only the driver and
 the tests pass `seed=True`.
 
-After any change to the database, run the behaviour tests (no LLM, no network,
-no credentials, ~1s):
+After any change to the database, run both test files (no LLM, no network, no
+credentials):
 
 ```bash
-uv run test_sqlite_database.py
+uv run test_sqlite_database.py      # behaviour, ~1s
+uv run test_sqlite_concurrency.py   # locking, ~20s
 ```
 
 Its oracle is `_ReferenceDatabase`, the original in-memory implementation,
@@ -203,6 +204,13 @@ as `registered worker`, not through an actual browser session.
 - **Run everything from `healthcare/`.** `agent.py` does a top-level
   `from sqlite_database import SqliteDatabase`; the driver compensates with
   `sys.path.insert(0, ".")`, which still assumes that cwd.
+- **Concurrent sessions do not lock.** WAL plus `busy_timeout=5000` (set on
+  every connection, since it is per-connection) makes writers queue instead of
+  raising. `test_sqlite_concurrency.py` proves it both ways LiveKit runs jobs —
+  threads (its Windows default) and separate processes (its Linux default) —
+  8 x 25 concurrent writes, and includes a control with `busy_timeout=0` that
+  still fails with `database is locked`. If that control ever stops failing,
+  the test has stopped proving anything.
 - **`add_appointment` is one transaction** in `sqlite_database.py`: it inserts
   the appointment and deletes the doctor's availability slot together. Split
   them and a crash in between double-books the doctor.
