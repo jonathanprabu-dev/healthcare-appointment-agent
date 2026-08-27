@@ -4,7 +4,7 @@
 terminal, so piped stdin is silently ignored and the agent just sits there
 seeing no user turns. This drives the same HealthcareAgent programmatically:
 a text-only AgentSession (no STT/TTS), scripted user turns, and a dump of the
-FakeDatabase afterwards so you can see what the agent actually mutated.
+database afterwards so you can see what the agent actually mutated.
 
 Run from the `healthcare/` directory:
     uv run .claude/skills/run-healthcare-agent/driver.py --scenario schedule
@@ -23,10 +23,9 @@ from datetime import date, datetime, time
 
 from dotenv import load_dotenv
 
-sys.path.insert(0, ".")  # agent.py does a top-level `from fake_database import ...`
+sys.path.insert(0, ".")  # agent.py does a top-level `from sqlite_database import ...`
 
 from agent import HealthcareAgent, UserData  # noqa: E402
-from fake_database import FakeDatabase  # noqa: E402
 from sqlite_database import SqliteDatabase  # noqa: E402
 
 from livekit.agents import AgentSession, inference  # noqa: E402
@@ -123,16 +122,18 @@ async def main() -> int:
     ap.add_argument(
         "--db",
         metavar="PATH",
-        help="run against SqliteDatabase at PATH instead of the in-memory "
-        "FakeDatabase. Use a throwaway path: the schedule assertions expect "
-        "unconsumed availability, so a reused file fails on the second run.",
+        default=":memory:",
+        help="database to run against (default: a throwaway in-memory one, "
+        "seeded with the demo fixtures). Point it at a file to inspect the "
+        "result afterwards — but use a fresh path each run, since the schedule "
+        "assertions expect unconsumed availability.",
     )
     args = ap.parse_args()
 
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.WARNING)
 
-    db = SqliteDatabase(args.db) if args.db else FakeDatabase()
-    print(f"database: {type(db).__name__}({args.db or 'in-memory'})", flush=True)
+    db = SqliteDatabase(args.db, seed=True)
+    print(f"database: {args.db}", flush=True)
     # Same wiring as entrypoint() in agent.py, minus STT/TTS (text only) and
     # minus the user_state_changed idle-nudge (no audio => no "away" state).
     session = AgentSession(

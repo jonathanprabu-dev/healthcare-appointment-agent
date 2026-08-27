@@ -7,7 +7,6 @@ from datetime import datetime
 from typing import Annotated
 
 from dotenv import load_dotenv
-from fake_database import FakeDatabase
 from pydantic import Field
 from sqlite_database import SqliteDatabase
 
@@ -45,14 +44,8 @@ SIP_TRUNK_ID = os.getenv("LIVEKIT_SIP_OUTBOUND_TRUNK")  # "ST_abcxyz"
 SUPERVISOR_PHONE_NUMBER = os.getenv("LIVEKIT_SUPERVISOR_PHONE_NUMBER")  # "+12003004000"
 SIP_NUMBER = os.getenv("LIVEKIT_SIP_NUMBER")  # "+15005006000" - caller ID shown to supervisor
 
-# Set CLINIC_DB to a file path to persist across sessions (SqliteDatabase);
-# unset, the in-memory FakeDatabase is used and every session starts fresh.
-CLINIC_DB = os.getenv("CLINIC_DB")
-
-
-def make_database():
-    """The database backing a session: SQLite when CLINIC_DB is set, else fake."""
-    return SqliteDatabase(CLINIC_DB) if CLINIC_DB else FakeDatabase()
+# Path to the clinic database. ":memory:" gives a throwaway per-session store.
+CLINIC_DB = os.getenv("CLINIC_DB", "clinic.db")
 
 VALID_INSURANCES = ["Anthem", "Aetna", "EmblemHealth", "HealthFirst"]
 
@@ -61,7 +54,7 @@ GLOBAL_INSTRUCTIONS = "Be succinct and to the point when assisting the user. Nev
 
 @dataclass
 class UserData:
-    database: FakeDatabase
+    database: SqliteDatabase
     profile: dict | None
 
 
@@ -762,7 +755,7 @@ server = AgentServer()
 
 @server.rtc_session()
 async def entrypoint(ctx: JobContext):
-    db = make_database()
+    db = SqliteDatabase(CLINIC_DB)
     userdata = UserData(database=db, profile=None)
     session = AgentSession(
         userdata=userdata,

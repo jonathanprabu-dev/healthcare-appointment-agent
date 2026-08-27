@@ -1,12 +1,12 @@
 ---
 name: run-healthcare-agent
-description: Run, launch, start, drive, or smoke-test the LiveKit healthcare voice agent (appointment scheduling and billing). Use when asked to run the agent, test a conversation flow end-to-end, check that a change to agent.py or fake_database.py still works, or reproduce a scheduling/billing/transfer scenario headlessly.
+description: Run, launch, start, drive, or smoke-test the LiveKit healthcare voice agent (appointment scheduling and billing). Use when asked to run the agent, test a conversation flow end-to-end, check that a change to agent.py or sqlite_database.py still works, or reproduce a scheduling/billing/transfer scenario headlessly.
 ---
 
 # Run the healthcare agent
 
 A LiveKit Agents 1.7 voice agent (`agent.py`) for appointment scheduling and
-billing, backed by an in-memory `FakeDatabase`. STT/LLM/TTS all come from
+billing, backed by SQLite (`sqlite_database.py`). STT/LLM/TTS all come from
 LiveKit Inference, so the only credentials needed are the LiveKit ones.
 
 **The agent path is `driver.py`** — a headless text driver that starts the same
@@ -102,35 +102,39 @@ and Dr. Henry Jekyll down from 3 availability slots to 2.
 
 ### Database
 
-Two interchangeable backends behind one interface:
+SQLite, one backend, `sqlite_database.py`. It returns plain dicts holding real
+`date`/`time`/`datetime` objects, and every method is synchronous because all
+16 call sites in `agent.py` are.
 
-- `fake_database.py` — in-memory, reseeded per process. The default.
-- `sqlite_database.py` — same twelve methods, persists to a file.
-
-`entrypoint()` picks by env var: `CLINIC_DB=clinic.db uv run agent.py console`
-uses SQLite; unset, it uses the fake. The driver takes `--db PATH` instead.
-
-**Use a throwaway path with the driver.** `schedule` asserts an unconsumed slot
-exists, so re-running against the same file fails the second time — the slot is
-already booked. Verified working:
+`entrypoint()` opens `CLINIC_DB` (default `clinic.db`). The driver defaults to
+`--db :memory:`, seeded, so runs are isolated and leave nothing behind. Point
+`--db` at a file to inspect the result afterwards, with a **fresh path each
+run** — `schedule` asserts an unconsumed slot exists, so a reused file
+correctly fails the second time:
 
 ```bash
 PYTHONUTF8=1 uv run .claude/skills/run-healthcare-agent/driver.py     --scenario schedule --db "$(mktemp -d)/clinic.db"
 ```
 
-After any change to either backend, run the parity check (no LLM, no network,
+**Seeding is opt-in** (`SqliteDatabase(path, seed=True)`) and off by default.
+The fixtures are two fictional patients and two fictional doctors; a
+deployment must not invent patient records on first boot. Only the driver and
+the tests pass `seed=True`.
+
+After any change to the database, run the behaviour tests (no LLM, no network,
 no credentials, ~1s):
 
 ```bash
-uv run test_sqlite_parity.py
+uv run test_sqlite_database.py
 ```
 
-It drives both backends through the same operations and diffs the results,
-including two **intentional** divergences it asserts rather than hides:
-FakeDatabase leaves an empty `appointments` key behind after a cancel while
-SQLite omits it (`agent.py` reads it via `.get("appointments", [])` either
-way), and SQLite returns availability in chronological order where the fake
-appends a restored slot at the end.
+Its oracle is `_ReferenceDatabase`, the original in-memory implementation,
+kept inside the test file and nowhere else — a differential comparison catches
+more than literal expectations. It asserts two **intentional** divergences
+from that reference rather than hiding them: SQLite omits the `appointments`
+key after a cancel where the reference leaves it empty (`agent.py` reads it
+via `.get("appointments", [])` either way), and SQLite returns availability in
+chronological order where the reference appends a restored slot at the end.
 
 ### Writing a new scenario
 
@@ -140,7 +144,7 @@ week?") — a live LLM picks the tools, so hedging makes runs nondeterministic.
 Add read-only scenarios to the `READ_ONLY` set so they are not failed for
 leaving the database alone.
 
-Seed data worth knowing (`fake_database.py`): `Mary Jane` / 2001-06-10 /
+Seed data worth knowing (`SqliteDatabase._seed`): `Mary Jane` / 2001-06-10 /
 Anthem, and `Peter Parker` / 2001-08-10 / Aetna. Anthem reaches both doctors,
 Aetna only Dr. Edward Hyde. Giving a name+DOB already in the table triggers
 the auth fast-path (`ProfileFound`); any other name goes down the longer
@@ -197,7 +201,7 @@ as `registered worker`, not through an actual browser session.
   real warm transfer needs `LIVEKIT_SIP_OUTBOUND_TRUNK`,
   `LIVEKIT_SUPERVISOR_PHONE_NUMBER`, `LIVEKIT_SIP_NUMBER` — untested here.
 - **Run everything from `healthcare/`.** `agent.py` does a top-level
-  `from fake_database import FakeDatabase`; the driver compensates with
+  `from sqlite_database import SqliteDatabase`; the driver compensates with
   `sys.path.insert(0, ".")`, which still assumes that cwd.
 - **`add_appointment` is one transaction** in `sqlite_database.py`: it inserts
   the appointment and deletes the doctor's availability slot together. Split

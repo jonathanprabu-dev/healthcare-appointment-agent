@@ -1,15 +1,19 @@
-"""SQLite-backed implementation of the FakeDatabase interface.
+"""The clinic database.
 
-Drop-in replacement for `FakeDatabase`: same twelve public methods, same
-return shapes (plain dicts holding real `date` / `time` / `datetime` objects,
-never sqlite3.Row and never ISO strings). Every call site in agent.py is
-synchronous, so this is deliberately synchronous too — sqlite3 is fast enough
-that offloading to a thread would cost more than it saves.
+Returns plain dicts holding real `date` / `time` / `datetime` objects — never
+sqlite3.Row, never ISO strings — because agent.py indexes and formats them
+directly. Every call site in agent.py is synchronous, so this is deliberately
+synchronous too; sqlite3 is fast enough that offloading to a thread would cost
+more than it saves.
 
     from sqlite_database import SqliteDatabase
-    db = SqliteDatabase("clinic.db")     # or ":memory:"
+    db = SqliteDatabase("clinic.db")                # empty unless seeded
+    db = SqliteDatabase(":memory:", seed=True)      # demo fixtures
 
-An empty database is seeded with the same fixtures as FakeDatabase.
+Single-machine only: WAL plus a busy timeout handles several concurrent
+sessions against one file, but not workers spread across machines. That
+migration is a reimplementation of this class against Postgres — the twelve
+methods below are the whole contract.
 """
 
 from __future__ import annotations
@@ -39,6 +43,8 @@ CREATE TABLE IF NOT EXISTS appointments (
     visit_reason     TEXT
 );
 
+CREATE INDEX IF NOT EXISTS idx_appointments_patient ON appointments(patient_id);
+
 CREATE TABLE IF NOT EXISTS doctors (
     id                  INTEGER PRIMARY KEY,
     name                TEXT NOT NULL UNIQUE,
@@ -56,11 +62,25 @@ CREATE TABLE IF NOT EXISTS availability (
 
 
 class SqliteDatabase:
-    def __init__(self, path: str = "clinic.db", *, seed: bool = True) -> None:
+    def __init__(self, path: str = "clinic.db", *, seed: bool = False) -> None:
+        """Open (and create if needed) the clinic database.
+
+        seed=True inserts the demo fixtures — two fictional patients and two
+        fictional doctors — into an empty database. It defaults to False: a
+        deployment must never invent patient records on first boot. The driver
+        and the tests pass seed=True explicitly.
+        """
         # check_same_thread=False: the agent runs tool calls off the event loop
         # thread in some paths; access here is serialized by SQLite's own lock.
         self._con = sqlite3.connect(path, check_same_thread=False)
         self._con.row_factory = sqlite3.Row
+        # WAL lets readers run concurrently with a writer — a worker per job
+        # means several sessions may touch this file at once. WAL is a property
+        # of the database and persists; busy_timeout is per-connection and has
+        # to be set on every open, or concurrent writes raise "database is
+        # locked" immediately instead of waiting their turn.
+        self._con.execute("PRAGMA journal_mode=WAL")
+        self._con.execute("PRAGMA busy_timeout=5000")
         self._con.executescript(SCHEMA)
         if seed and not self._con.execute("SELECT 1 FROM patients LIMIT 1").fetchone():
             self._seed()
@@ -134,8 +154,8 @@ class SqliteDatabase:
                 (row["id"],),
             )
         ]
-        # FakeDatabase only grows the key once an appointment exists, and
-        # agent.py branches on `record.get("appointments", [])`.
+        # Omitted rather than empty when there are no appointments; agent.py
+        # reads it as `record.get("appointments", [])`.
         if appointments:
             record["appointments"] = appointments
         return record
@@ -222,8 +242,8 @@ class SqliteDatabase:
         return cur.rowcount > 0
 
     def add_patient_record(self, info: dict) -> None:
-        # Mutates `info` exactly like FakeDatabase: agent.py keeps a reference
-        # to this dict as session profile and expects the balance to appear.
+        # Mutates `info` in place: agent.py keeps a reference to this dict as
+        # the session profile and expects the balance to appear on it.
         info.setdefault("outstanding_balance", round(random.uniform(20, 3000), 2))
         with self._con:
             self._con.execute(
@@ -269,7 +289,7 @@ class SqliteDatabase:
         if isinstance(appt_time, str):
             appt_time = datetime.fromisoformat(appt_time)
         # Matched by value: the caller passes back a dict read earlier, which
-        # is a snapshot here rather than the live object FakeDatabase returns.
+        # is a snapshot, not a live reference into the store.
         with self._con:
             cur = self._con.execute(
                 "DELETE FROM appointments WHERE id = ("
