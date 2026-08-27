@@ -204,9 +204,13 @@ as `registered worker`, not through an actual browser session.
 - **Run everything from `healthcare/`.** `agent.py` does a top-level
   `from sqlite_database import SqliteDatabase`; the driver compensates with
   `sys.path.insert(0, ".")`, which still assumes that cwd.
-- **Concurrent sessions do not lock.** WAL plus `busy_timeout=5000` (set on
-  every connection, since it is per-connection) makes writers queue instead of
-  raising. `test_sqlite_concurrency.py` proves it both ways LiveKit runs jobs —
+- **Concurrent sessions do not lock.** WAL plus a 5s `busy_timeout` (set on
+  every connection, since it is per-connection; override with
+  `SQLITE_BUSY_TIMEOUT_MS`) makes writers queue instead of raising. Measured
+  ceiling: ~32 simultaneously-writing sessions, where the worst wait reaches
+  ~3.2s; at 64 it crosses 5s and raises. Raising the timeout moves that wall
+  proportionally but turns the failure into dead air mid-call, which is worse
+  — treat a lock error as the signal to move to Postgres, not to retune. `test_sqlite_concurrency.py` proves it both ways LiveKit runs jobs —
   threads (its Windows default) and separate processes (its Linux default) —
   8 x 25 concurrent writes, and includes a control with `busy_timeout=0` that
   still fails with `database is locked`. If that control ever stops failing,

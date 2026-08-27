@@ -19,9 +19,17 @@ methods below are the whole contract.
 from __future__ import annotations
 
 import json
+import os
 import random
 import sqlite3
 from datetime import date, datetime, time, timedelta
+
+# How long a write waits for the lock before raising "database is locked".
+# 5s is sized for a caller on the phone: these writes happen inside tool calls,
+# so the wait is dead air. Raising it converts a rare error into a longer
+# silence, which is the worse failure — the env var exists to be turned DOWN
+# during an incident, or up briefly with that tradeoff understood.
+BUSY_TIMEOUT_MS = int(os.getenv("SQLITE_BUSY_TIMEOUT_MS", "5000"))
 
 SCHEMA = """
 PRAGMA foreign_keys = ON;
@@ -74,13 +82,14 @@ class SqliteDatabase:
         # thread in some paths; access here is serialized by SQLite's own lock.
         self._con = sqlite3.connect(path, check_same_thread=False)
         self._con.row_factory = sqlite3.Row
-        # WAL lets readers run concurrently with a writer — a worker per job
-        # means several sessions may touch this file at once. WAL is a property
-        # of the database and persists; busy_timeout is per-connection and has
-        # to be set on every open, or concurrent writes raise "database is
-        # locked" immediately instead of waiting their turn.
+        # WAL lets readers run concurrently with a writer — LiveKit runs jobs
+        # as threads (Windows) or separate processes (Linux), so several
+        # sessions may touch this file at once. WAL is a property of the
+        # database and persists; busy_timeout is per-connection and has to be
+        # set on every open, or concurrent writes raise "database is locked"
+        # immediately instead of waiting their turn.
         self._con.execute("PRAGMA journal_mode=WAL")
-        self._con.execute("PRAGMA busy_timeout=5000")
+        self._con.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
         self._con.executescript(SCHEMA)
         if seed and not self._con.execute("SELECT 1 FROM patients LIMIT 1").fetchone():
             self._seed()

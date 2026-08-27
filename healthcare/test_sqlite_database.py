@@ -174,12 +174,35 @@ class _ReferenceDatabase:
 FAILURES: list[str] = []
 
 
+def _timeout_under_env(value: str) -> int:
+    """Reimport the module with the env var set — it is read at import time."""
+    import importlib
+    import os
+
+    previous = os.environ.get("SQLITE_BUSY_TIMEOUT_MS")
+    os.environ["SQLITE_BUSY_TIMEOUT_MS"] = value
+    try:
+        import sqlite_database
+
+        reloaded = importlib.reload(sqlite_database)
+        db = reloaded.SqliteDatabase(":memory:")
+        timeout = db._con.execute("PRAGMA busy_timeout").fetchone()[0]
+        db.close()
+        return timeout
+    finally:
+        if previous is None:
+            del os.environ["SQLITE_BUSY_TIMEOUT_MS"]
+        else:
+            os.environ["SQLITE_BUSY_TIMEOUT_MS"] = previous
+        importlib.reload(sqlite_database)
+
+
 def check(label: str, reference: object, sql: object) -> None:
     if reference == sql:
         print(f"  ok   {label}")
     else:
         FAILURES.append(label)
-        print(f"  FAIL {label}\n       fake:   {fake!r}\n       sqlite: {sql!r}")
+        print(f"  FAIL {label}\n       reference: {reference!r}\n       sqlite:    {sql!r}")
 
 
 def both(step: str, fn) -> None:  # noqa: ANN001
@@ -355,6 +378,18 @@ with tempfile.TemporaryDirectory() as tmp:
         reloaded["appointments"][0]["appointment_time"],
     )
     second.close()
+
+print("\nconnection settings")
+_settings = SqliteDatabase(":memory:")
+check(
+    "busy_timeout defaults to 5s",
+    5000,
+    _settings._con.execute("PRAGMA busy_timeout").fetchone()[0],
+)
+check("SQLITE_BUSY_TIMEOUT_MS overrides it", 250, _timeout_under_env("250"))
+_settings.close()
+# WAL is a property of the file, and ":memory:" always reports "memory";
+# test_sqlite_concurrency.py checks journal_mode on a real file.
 
 print("\nseeding is opt-in")
 with tempfile.TemporaryDirectory() as tmp:
