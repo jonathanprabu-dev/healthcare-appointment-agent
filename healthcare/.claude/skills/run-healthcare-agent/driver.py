@@ -44,6 +44,16 @@ SCENARIOS: dict[str, list[str]] = {
         "The reason is a persistent cough.",
         "Yes, that is correct. Please confirm the appointment.",
     ],
+    "reschedule": [
+        "I need to reschedule my existing appointment.",
+        "My name is Mary Jane.",
+        "June 10th, 2001.",
+        "Reschedule the appointment with Dr. Henry Jekyll.",
+        "Book me with Dr. Henry Jekyll again.",
+        "The first available slot works.",
+        "The reason is a follow-up visit.",
+        "Yes, that is correct. Please confirm.",
+    ],
     "billing": [
         "I want to pay my bill.",
         "My name is Peter Parker.",
