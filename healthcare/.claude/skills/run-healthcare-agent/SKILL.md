@@ -137,6 +137,28 @@ key after a cancel where the reference leaves it empty (`agent.py` reads it
 via `.get("appointments", [])` either way), and SQLite returns availability in
 chronological order where the reference appends a restored slot at the end.
 
+### Admin CLI
+
+`admin.py` is the only way real doctors, insurances and availability get into
+the database (the agent creates patients itself, mid-call):
+
+```bash
+uv run admin.py --db clinic.db add-doctor "Dr. Ada Chen" --insurances Anthem Aetna
+uv run admin.py --db clinic.db add-slots "Dr. Ada Chen" --from 2026-09-01 --to 2026-09-14     --times 09:00 09:30 10:00 --weekdays mon tue wed thu fri
+uv run admin.py --db clinic.db add-patient "Ada Lovelace" --dob 1990-12-10     --phone 15551234567 --insurance Anthem
+uv run admin.py --db clinic.db list-doctors     # also: list-patients, appointments
+```
+
+`add-slots` re-runs safely: it skips slots already offered and slots already
+booked. To drive the agent against that data instead of the fixtures, use
+`--no-seed`, and `--turns "a;b;c"` for an ad-hoc script:
+
+```bash
+PYTHONUTF8=1 uv run .claude/skills/run-healthcare-agent/driver.py --db clinic.db --no-seed     --turns "I want to book an appointment.;My name is Ada Lovelace.;December 10th, 1990."
+```
+
+Deployment (browser frontend, telephony) is in `DEPLOYMENT.md`.
+
 ### Writing a new scenario
 
 Add a list of user turns to `SCENARIOS` in `driver.py`. Keep them blunt and
@@ -215,6 +237,10 @@ as `registered worker`, not through an actual browser session.
   8 x 25 concurrent writes, and includes a control with `busy_timeout=0` that
   still fails with `database is locked`. If that control ever stops failing,
   the test has stopped proving anything.
+- **A slot is claimed by DELETE, not by INSERT.** `add_appointment` deletes the
+  availability row first and returns False if it removed nothing — that is what
+  stops two callers taking the same slot, and it also refuses a time that was
+  never offered. Any test that books a made-up time now correctly fails.
 - **`add_appointment` is one transaction** in `sqlite_database.py`: it inserts
   the appointment and deletes the doctor's availability slot together. Split
   them and a crash in between double-books the doctor.
