@@ -656,9 +656,18 @@ class HealthcareAgent(Agent):
             "visit_reason": result.visit_reason,
         }
 
-        self._database.add_appointment(
+        booked = self._database.add_appointment(
             name=self.session.userdata.profile["name"], appointment=appointment
         )
+        if not booked:
+            # Someone else claimed the slot between it being offered and
+            # confirmed. Say so rather than reporting a booking that is not
+            # in the database.
+            logger.info("slot %s with %s was taken", result.appointment_time, result.doctor_name)
+            raise ToolError(
+                "That time was just taken by another patient. Apologize, and offer to pick "
+                "another available time."
+            )
 
         return "The appointment has been made, ask the user if they need assistance with anything else."
 
@@ -687,10 +696,23 @@ class HealthcareAgent(Agent):
                 "visit_reason": result.new_appointment.visit_reason,
             }
 
-            self._database.add_appointment(
+            booked = self._database.add_appointment(
                 name=self.session.userdata.profile["name"], appointment=appointment
             )
-            confirmation_message += f" and a new appointment ({json.dumps(appointment, default=str)}) has been scheduled."
+            if booked:
+                confirmation_message += f" and a new appointment ({json.dumps(appointment, default=str)}) has been scheduled."
+            else:
+                # The old appointment is already cancelled at this point, so
+                # the user must not be told the new one exists when it does not.
+                logger.info(
+                    "reschedule lost slot %s with %s",
+                    result.new_appointment.appointment_time,
+                    result.new_appointment.doctor_name,
+                )
+                confirmation_message += (
+                    ", but the new time was just taken by another patient. Apologize, say the "
+                    "old appointment is gone, and offer to pick another available time."
+                )
 
         return confirmation_message
 

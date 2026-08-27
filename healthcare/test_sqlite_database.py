@@ -398,6 +398,37 @@ with tempfile.TemporaryDirectory() as tmp:
     check("...and no doctors", [], empty.doctor_records)
     empty.close()
 
+
+print("\nslot claiming (no reference equivalent: the reference never refused)")
+_claim = SqliteDatabase(":memory:", seed=True)
+_slot = _claim.get_doctor_by_name("Dr. Edward Hyde")["availability"][0]
+_booking = {
+    "doctor_name": "Dr. Edward Hyde",
+    "appointment_time": datetime.combine(_slot["date"], _slot["time"]),
+    "visit_reason": "first",
+}
+check("first booking of an offered slot succeeds", True, _claim.add_appointment("Mary Jane", dict(_booking)))
+check(
+    "second booking of the same slot is refused",
+    False,
+    _claim.add_appointment("Peter Parker", dict(_booking, visit_reason="second")),
+)
+check(
+    "a time that was never offered is refused",
+    False,
+    _claim.add_appointment(
+        "Mary Jane",
+        {
+            "doctor_name": "Dr. Edward Hyde",
+            "appointment_time": datetime(2031, 7, 4, 3, 0),
+            "visit_reason": "invented",
+        },
+    ),
+)
+check("only the winner has an appointment", 1, len(_claim.get_patient_by_name("Mary Jane")["appointments"]))
+check("the loser has none", None, _claim.get_patient_by_name("Peter Parker").get("appointments"))
+_claim.close()
+
 print()
 if FAILURES:
     print(f"FAILED: {len(FAILURES)} check(s): {FAILURES}")

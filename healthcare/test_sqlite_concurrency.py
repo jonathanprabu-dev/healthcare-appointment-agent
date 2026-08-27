@@ -43,23 +43,50 @@ def _book(path: str, worker: int, count: int, results: list) -> None:
     try:
         for i in range(count):
             # Distinct slot per write, so nothing serializes on the same row.
-            slot = datetime.combine(date(2030, 1, 1), time(0, 0)) + timedelta(
-                minutes=worker * 1000 + i
-            )
-            db.add_appointment(
+            booked = db.add_appointment(
                 "Mary Jane",
                 {
-                    "doctor_name": f"Dr. Worker {worker}",
-                    "appointment_time": slot,
+                    "doctor_name": f"Dr. W{worker}",
+                    "appointment_time": _slot_for(worker, i),
                     "visit_reason": "load",
                 },
             )
+            if not booked:
+                raise AssertionError(f"worker {worker} write {i} was refused a prepared slot")
             db.apply_payment("Mary Jane", 0.01)
         results.append(None)
     except Exception as exc:  # noqa: BLE001 - the point is to catch lock errors
         results.append(f"worker {worker}: {type(exc).__name__}: {exc}")
     finally:
         db.close()
+
+
+def _slot_for(worker: int, i: int) -> datetime:
+    return datetime.combine(date(2030, 1, 1), time(0, 0)) + timedelta(minutes=worker * 1000 + i)
+
+
+def prepare_load_fixtures(path: str, rounds: int) -> None:
+    """Give every load writer its own doctor and its own offered slots.
+
+    add_appointment claims a slot by deleting it, so a booking for a time that
+    was never offered is refused. The load test needs real, bookable slots.
+    """
+    con = sqlite3.connect(path)
+    with con:
+        for worker in range(WORKERS):
+            cur = con.execute(
+                "INSERT INTO doctors (name, accepted_insurances) VALUES (?, '[]')",
+                (f"Dr. W{worker}",),
+            )
+            con.executemany(
+                "INSERT INTO availability (doctor_id, date, time) VALUES (?, ?, ?)",
+                [
+                    (cur.lastrowid, _slot_for(worker, i).date().isoformat(),
+                     _slot_for(worker, i).time().isoformat())
+                    for i in range(rounds)
+                ],
+            )
+    con.close()
 
 
 def _book_process(path: str, worker: int, count: int, queue) -> None:  # noqa: ANN001
@@ -115,22 +142,83 @@ def _control_no_busy_timeout(path: str, worker: int, results: list) -> None:
         con.close()
 
 
+def race_for_one_slot() -> None:
+    """32 callers confirm the same slot at once. Exactly one may win."""
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        path = str(Path(tmp) / "race.db")
+        seeded = SqliteDatabase(path, seed=True)
+        slot = seeded.get_doctor_by_name("Dr. Henry Jekyll")["availability"][0]
+        contested = datetime.combine(slot["date"], slot["time"])
+        seeded.close()
+
+        winners: list = []
+        barrier = threading.Barrier(32)
+
+        def claim() -> None:
+            db = SqliteDatabase(path)
+            barrier.wait()  # everyone attempts at the same instant
+            try:
+                if db.add_appointment(
+                    "Mary Jane",
+                    {
+                        "doctor_name": "Dr. Henry Jekyll",
+                        "appointment_time": contested,
+                        "visit_reason": "race",
+                    },
+                ):
+                    winners.append(1)
+            finally:
+                db.close()
+
+        threads = [threading.Thread(target=claim) for _ in range(32)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        check("exactly one caller wins the contested slot", 1, len(winners))
+        con = sqlite3.connect(path)
+        check(
+            "exactly one appointment row exists",
+            1,
+            con.execute("SELECT COUNT(*) FROM appointments").fetchone()[0],
+        )
+        check(
+            "the slot is gone from availability",
+            0,
+            con.execute(
+                "SELECT COUNT(*) FROM availability WHERE date = ? AND time = ?",
+                (slot["date"].isoformat(), slot["time"].isoformat()),
+            ).fetchone()[0],
+        )
+        con.close()
+
+
 def main() -> int:
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
-        path = str(Path(tmp) / "clinic.db")
-        SqliteDatabase(path, seed=True).close()
+        # A file per run: add_appointment consumes the slot it books, so the
+        # two runs cannot share one set of prepared slots.
+        thread_db = str(Path(tmp) / "threads.db")
+        process_db = str(Path(tmp) / "processes.db")
+        for path in (thread_db, process_db):
+            SqliteDatabase(path, seed=True).close()
+            prepare_load_fixtures(path, BOOKINGS_PER_WORKER)
 
         print(f"\n{WORKERS} concurrent threads x {BOOKINGS_PER_WORKER} bookings (Windows shape)")
-        check("no errors", [], run_threads(path))
+        check("no errors", [], run_threads(thread_db))
 
         print(f"\n{WORKERS} concurrent processes x {BOOKINGS_PER_WORKER} bookings (Linux shape)")
-        check("no errors", [], run_processes(path))
+        check("no errors", [], run_processes(process_db))
 
-        con = sqlite3.connect(path)
-        written = con.execute("SELECT COUNT(*) FROM appointments").fetchone()[0]
-        check("every write landed", WORKERS * BOOKINGS_PER_WORKER * 2, written)
-        check("journal_mode", "wal", con.execute("PRAGMA journal_mode").fetchone()[0])
-        con.close()
+        for label, path in (("threads", thread_db), ("processes", process_db)):
+            con = sqlite3.connect(path)
+            written = con.execute("SELECT COUNT(*) FROM appointments").fetchone()[0]
+            check(f"every {label} write landed", WORKERS * BOOKINGS_PER_WORKER, written)
+            check("journal_mode", "wal", con.execute("PRAGMA journal_mode").fetchone()[0])
+            con.close()
+
+    print("\n32 callers racing for the same slot")
+    race_for_one_slot()
 
     print("\ncontrol: same load with busy_timeout=0")
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:

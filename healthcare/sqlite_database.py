@@ -274,9 +274,24 @@ class SqliteDatabase:
         appt_time = appointment["appointment_time"]
         if isinstance(appt_time, str):
             appt_time = datetime.fromisoformat(appt_time)
-        # One transaction: booking the slot and consuming the doctor's
-        # availability must not be separable, or a crash double-books.
+        # One transaction, and the DELETE is the claim: whoever removes the
+        # availability row owns the slot. Deleting first means a second caller
+        # racing for the same slot deletes nothing, sees rowcount 0, and is
+        # turned away instead of double-booking the doctor. Reading
+        # availability and then inserting would let both callers pass the read
+        # before either wrote.
         with self._con:
+            claimed = self._con.execute(
+                "DELETE FROM availability WHERE date = ? AND time = ? AND doctor_id ="
+                " (SELECT id FROM doctors WHERE name = ?)",
+                (
+                    appt_time.date().isoformat(),
+                    appt_time.time().isoformat(),
+                    appointment["doctor_name"],
+                ),
+            )
+            if claimed.rowcount == 0:
+                return False  # already taken, or never an offered slot
             self._con.execute(
                 "INSERT INTO appointments (patient_id, doctor_name, appointment_time,"
                 " visit_reason) VALUES (?, ?, ?, ?)",
@@ -287,7 +302,6 @@ class SqliteDatabase:
                     appointment.get("visit_reason"),
                 ),
             )
-            self._remove_availability(appointment["doctor_name"], appt_time.date(), appt_time.time())
         return True
 
     def cancel_appointment(self, name: str, appointment: dict) -> bool:
