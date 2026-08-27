@@ -267,6 +267,61 @@ class SqliteDatabase:
                 ),
             )
 
+    def add_doctor(self, name: str, accepted_insurances: list[str]) -> bool:
+        """Register a doctor. False if that name is already taken."""
+        try:
+            with self._con:
+                self._con.execute(
+                    "INSERT INTO doctors (name, accepted_insurances) VALUES (?, ?)",
+                    (name, json.dumps(list(accepted_insurances))),
+                )
+        except sqlite3.IntegrityError:
+            return False
+        return True
+
+    def add_availability(self, doctor_name: str, slots: list[tuple[date, time]]) -> int:
+        """Offer slots for a doctor. Returns how many were newly added.
+
+        Slots the doctor already has are skipped rather than duplicated, so
+        re-running a generator over an overlapping range is safe. A slot that
+        is already booked has no availability row, so this WILL re-offer it —
+        check appointments first if that matters.
+        """
+        row = self._con.execute("SELECT id FROM doctors WHERE name = ?", (doctor_name,)).fetchone()
+        if row is None:
+            return 0
+        with self._con:
+            cur = self._con.executemany(
+                "INSERT OR IGNORE INTO availability (doctor_id, date, time) VALUES (?, ?, ?)",
+                [(row["id"], d.isoformat(), t.isoformat()) for d, t in slots],
+            )
+        return cur.rowcount
+
+    def booked_times(self, doctor_name: str) -> set[datetime]:
+        """Times this doctor is already booked for — availability has no row."""
+        return {
+            datetime.fromisoformat(r["appointment_time"])
+            for r in self._con.execute(
+                "SELECT appointment_time FROM appointments WHERE doctor_name = ?", (doctor_name,)
+            )
+        }
+
+    def appointments(self) -> list[dict]:
+        """Every appointment in the clinic, patient included, soonest first."""
+        return [
+            {
+                "patient_name": r["patient_name"],
+                "doctor_name": r["doctor_name"],
+                "appointment_time": datetime.fromisoformat(r["appointment_time"]),
+                "visit_reason": r["visit_reason"],
+            }
+            for r in self._con.execute(
+                "SELECT p.name AS patient_name, a.doctor_name, a.appointment_time,"
+                " a.visit_reason FROM appointments a JOIN patients p ON p.id = a.patient_id"
+                " ORDER BY a.appointment_time"
+            )
+        ]
+
     def add_appointment(self, name: str, appointment: dict) -> bool:
         patient_id = self._patient_id(name)
         if patient_id is None:

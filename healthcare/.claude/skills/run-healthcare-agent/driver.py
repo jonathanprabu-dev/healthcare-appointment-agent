@@ -130,6 +130,17 @@ async def main() -> int:
     ap.add_argument("--turn-timeout", type=float, default=120.0)
     ap.add_argument("--verbose", action="store_true", help="show livekit DEBUG logs")
     ap.add_argument(
+        "--turns",
+        help="run an ad-hoc script instead of a named scenario: user turns "
+        "separated by ';'. Implies no database assertion beyond 'something changed'.",
+    )
+    ap.add_argument(
+        "--no-seed",
+        action="store_true",
+        help="do not insert the demo fixtures — use the database exactly as it is, "
+        "which is what you want against real admin-created data.",
+    )
+    ap.add_argument(
         "--db",
         metavar="PATH",
         default=":memory:",
@@ -142,8 +153,9 @@ async def main() -> int:
 
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.WARNING)
 
-    db = SqliteDatabase(args.db, seed=True)
-    print(f"database: {args.db}", flush=True)
+    db = SqliteDatabase(args.db, seed=not args.no_seed)
+    print(f"database: {args.db} (seed={not args.no_seed})", flush=True)
+    turns = [t.strip() for t in args.turns.split(";") if t.strip()] if args.turns else None
     # Same wiring as entrypoint() in agent.py, minus STT/TTS (text only) and
     # minus the user_state_changed idle-nudge (no audio => no "away" state).
     session = AgentSession(
@@ -166,7 +178,7 @@ async def main() -> int:
     await _settle(session)
 
     try:
-        for i, turn in enumerate(SCENARIOS[args.scenario], start=1):
+        for i, turn in enumerate(turns or SCENARIOS[args.scenario], start=1):
             print(f"\n>>> user: {turn}", flush=True)
             try:
                 result = await asyncio.wait_for(
@@ -187,6 +199,8 @@ async def main() -> int:
 
     changed = before != json.dumps(db.patient_records, default=_json_default, sort_keys=True)
     print(f"\nDATABASE MUTATED: {changed}")
+    if turns:
+        return 0 if changed else 1
     if args.scenario in READ_ONLY:
         return 0
     if args.scenario == "schedule":

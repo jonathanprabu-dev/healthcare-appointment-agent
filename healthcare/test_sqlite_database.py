@@ -429,6 +429,39 @@ check("only the winner has an appointment", 1, len(_claim.get_patient_by_name("M
 check("the loser has none", None, _claim.get_patient_by_name("Peter Parker").get("appointments"))
 _claim.close()
 
+
+print("\nadmin surface")
+_admin = SqliteDatabase(":memory:")
+check("add_doctor", True, _admin.add_doctor("Dr. Ada Chen", ["Anthem"]))
+check("add_doctor rejects a duplicate name", False, _admin.add_doctor("Dr. Ada Chen", ["Aetna"]))
+_slots = [(date(2030, 5, 1), time(9, 0)), (date(2030, 5, 1), time(9, 30))]
+check("add_availability", 2, _admin.add_availability("Dr. Ada Chen", _slots))
+check("add_availability skips duplicates", 0, _admin.add_availability("Dr. Ada Chen", _slots))
+check("add_availability on an unknown doctor", 0, _admin.add_availability("Dr. Nobody", _slots))
+_admin.add_patient_record(info={
+    "name": "Ada Lovelace",
+    "date_of_birth": date(1990, 12, 10),
+    "phone_number": "15551234567",
+    "insurance": "Anthem",
+})
+check("the new doctor is reachable by insurance", ["Dr. Ada Chen"],
+      [d["name"] for d in _admin.get_compatible_doctors("Anthem")])
+check("booked_times is empty before booking", set(), _admin.booked_times("Dr. Ada Chen"))
+_admin.add_appointment("Ada Lovelace", {
+    "doctor_name": "Dr. Ada Chen",
+    "appointment_time": datetime(2030, 5, 1, 9, 0),
+    "visit_reason": "checkup",
+})
+check("booked_times reports the booking", {datetime(2030, 5, 1, 9, 0)},
+      _admin.booked_times("Dr. Ada Chen"))
+check("appointments() joins the patient in",
+      [("Ada Lovelace", "Dr. Ada Chen", datetime(2030, 5, 1, 9, 0), "checkup")],
+      [(a["patient_name"], a["doctor_name"], a["appointment_time"], a["visit_reason"])
+       for a in _admin.appointments()])
+check("the booked slot is no longer offered", 1,
+      len(_admin.get_doctor_by_name("Dr. Ada Chen")["availability"]))
+_admin.close()
+
 print()
 if FAILURES:
     print(f"FAILED: {len(FAILURES)} check(s): {FAILURES}")
