@@ -61,12 +61,16 @@ unlikely to reach it; it is the number to watch if it grows.
 
 ## 2. Telephony
 
-**Partly done, one step blocked.** `lk` 2.18.3 is installed and a number is
-purchased. Current state on the project:
+**Working — verified by real inbound calls on 2026-08-28.** `lk` 2.18.3 is
+installed and a number is purchased. What those calls verified is *routing*: the
+number rings, the worker picks up the job, and the agent speaks. They did not
+verify booking — on both calls `schedule_appointment` hung until the caller gave
+up (root cause and fix in `test_profile_authenticator.py`'s docstring; the fix
+itself is still unverified by voice). Current state on the project:
 
 | Thing | ID | State |
 |---|---|---|
-| Phone number | `PN_PPN_QwQP3U5s6VWc` (+1 484-295-1233) | ACTIVE, **no dispatch rule assigned** |
+| Phone number | `PN_PPN_QwQP3U5s6VWc` (+1 484-295-1233) | ACTIVE, routes to the agent |
 | Dispatch rule | `SDR_CMDNYY2FKGXb` | individual, `call-` prefix, agent `healthcare-agent` |
 | Inbound trunk | — | none, and none is needed |
 
@@ -92,22 +96,39 @@ Note the tradeoff: naming the agent switches it to **explicit dispatch**, so it
 stops picking up rooms automatically. Leave `LIVEKIT_AGENT_NAME` unset for
 browser/playground testing.
 
-**The blocked step** is assigning the number to the rule. The documented
-command fails against the API:
+**No explicit number-to-rule assignment is needed, and attempting one fails.**
+`sip-dispatch-rule.json` sets neither a trunk nor an inbound number, so
+`SDR_CMDNYY2FKGXb` is a catch-all occupying the `(any trunk, any number, no
+PIN)` slot — and a catch-all already routes this number. Two real calls
+confirmed it while `lk number get` still reported `SIP Dispatch Rules: -`; that
+dash is not a sign that anything is wrong.
+
+Both ways of assigning it explicitly fail, and for the same reason. The CLI
+returns an opaque error:
 
 ```
 lk number update --id PN_PPN_QwQP3U5s6VWc --sip-dispatch-rule-id SDR_CMDNYY2FKGXb
 twirp error invalid_argument: twirp error unknown: Failed to update phone number
 ```
 
-Tried and ruled out: `--number` instead of `--id`; before and after the number
-went ACTIVE; with and without an inbound trunk; with a rule that names an agent
-and one that does not. `--curl` shows a well-formed request —
-`{"id":"PN_PPN_...","sipDispatchRuleId":"SDR_..."}` to
-`PhoneNumberService/UpdatePhoneNumber` — so the payload is not the problem. Do
-it in the **Cloud dashboard** instead: Telephony → Phone Numbers → ⋮ →
-*Assign dispatch rule*. Until it is assigned, calls to the number reach
-nothing.
+The dashboard (Telephony → Phone Numbers → ⋮ → *Assign dispatch rule*) is
+clearer, and names the cause:
+
+```
+Dispatch rule for the same trunk, inbound number, number, and PIN combination
+already exists in dispatch rule "SDR_CMDNYY2FKGXb" "healthcare-inbound"
+```
+
+The assign flow creates a *new* rule scoped to the number, which collides with
+the existing catch-all. So: leave it unassigned. If a scoped rule is ever
+wanted, delete `SDR_CMDNYY2FKGXb` first and recreate it with an inbound number
+set — keeping `roomConfig.agents` intact, or explicit dispatch stops reaching
+the named worker.
+
+Ruled out along the way: `--number` instead of `--id`; before and after the
+number went ACTIVE; with and without an inbound trunk; against
+`cloud-api.livekit.io`. `--curl` shows a well-formed request, so the payload was
+never the problem.
 
 Warm transfer is a separate, still-unconfigured path (see below); note that
 LiveKit Phone Numbers are **inbound only**, so a transfer needs a trunk from
