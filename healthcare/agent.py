@@ -922,6 +922,14 @@ async def entrypoint(ctx: JobContext):
             "inworld/inworld-tts-2",
             voice="Luna",
             extra_kwargs={"delivery_mode": "CREATIVE", "speaking_rate": 1.1},
+            # A real caller got 4m34s of silence when synthesis stalled: the
+            # agent had answered, asked for the greeting, and simply waited --
+            # the configured 10s timeout never fired, and nothing told the
+            # caller anything was wrong. These run server-side in LiveKit
+            # Inference, so a provider outage is switched away from there
+            # rather than here. The caller may hear the voice change mid-call;
+            # that is the intended trade against dead air.
+            fallback=["cartesia/sonic-2", "elevenlabs/eleven_flash_v2_5"],
         ),
         preemptive_generation=True,
         # Flip user_state to "away" after 10s of mutual silence so we can
