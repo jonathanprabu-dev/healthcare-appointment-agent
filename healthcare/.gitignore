@@ -4,3 +4,5 @@ __pycache__/
 clinic.db
 *.db
 *.db-journal
+*.db-shm
+*.db-wal
