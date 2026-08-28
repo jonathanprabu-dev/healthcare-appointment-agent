@@ -1,0 +1,413 @@
+/* Design tokens. Dark is a selected set of steps for the dark surface, not an
+   automatic inversion of the light one -- the same rule the chart palette
+   follows. Both scopes are declared so the OS setting and an explicit toggle
+   both work, with the toggle winning. */
+:root {
+  --surface-0: #f4f4f1;
+  --surface-1: #fcfcfb;
+  --surface-2: #eeeeea;
+  --border: #dcdcd6;
+  --text-primary: #0b0b0b;
+  --text-secondary: #52514e;
+  --text-muted: #7a7973;
+
+  --series-1: #2a78d6; /* blue   */
+  --series-2: #eb6834; /* orange */
+  --series-3: #1baf7a; /* aqua   */
+
+  --good: #008300;
+  --warning: #eda100;
+  --critical: #e34948;
+
+  --radius: 10px;
+  --gap: 16px;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:where(:not([data-theme="light"])) {
+    color-scheme: dark;
+    --surface-0: #111110;
+    --surface-1: #1a1a19;
+    --surface-2: #232322;
+    --border: #34342f;
+    --text-primary: #ffffff;
+    --text-secondary: #c3c2b7;
+    --text-muted: #918f85;
+
+    --series-1: #3987e5;
+    --series-2: #d95926;
+    --series-3: #199e70;
+
+    --good: #4aa54a;
+    --warning: #c98500;
+    --critical: #e66767;
+  }
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --surface-0: #111110;
+  --surface-1: #1a1a19;
+  --surface-2: #232322;
+  --border: #34342f;
+  --text-primary: #ffffff;
+  --text-secondary: #c3c2b7;
+  --text-muted: #918f85;
+
+  --series-1: #3987e5;
+  --series-2: #d95926;
+  --series-3: #199e70;
+
+  --good: #4aa54a;
+  --warning: #c98500;
+  --critical: #e66767;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--surface-0);
+  color: var(--text-primary);
+  font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  font-variant-numeric: tabular-nums;
+}
+
+.app {
+  max-width: 1280px;
+  margin: 0 auto;
+  padding: 24px;
+}
+
+/* ------------------------------------------------------------------ header */
+
+.topbar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 20px;
+}
+
+.topbar h1 {
+  font-size: 20px;
+  font-weight: 650;
+  margin: 0;
+  letter-spacing: -0.01em;
+}
+
+.topbar .spacer {
+  flex: 1;
+}
+
+.status {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 5px 11px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--surface-1);
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 550;
+}
+
+.status .dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--text-muted);
+}
+
+/* Status is never colour alone -- the word beside the dot carries it. */
+.status[data-state="live"] .dot {
+  background: var(--good);
+}
+.status[data-state="offline"] .dot {
+  background: var(--critical);
+}
+.status[data-state="connecting"] .dot,
+.status[data-state="reconnecting"] .dot {
+  background: var(--warning);
+}
+
+button.ghost {
+  border: 1px solid var(--border);
+  background: var(--surface-1);
+  color: var(--text-secondary);
+  border-radius: 8px;
+  padding: 6px 12px;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 550;
+  cursor: pointer;
+}
+
+button.ghost:hover {
+  color: var(--text-primary);
+  border-color: var(--text-muted);
+}
+
+/* -------------------------------------------------------------- stat tiles */
+
+.kpis {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(168px, 1fr));
+  gap: var(--gap);
+  margin-bottom: var(--gap);
+}
+
+.card {
+  background: var(--surface-1);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 16px;
+}
+
+.tile .label {
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 550;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.tile .value {
+  font-size: 30px;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  margin-top: 6px;
+  line-height: 1.1;
+}
+
+.tile .sub {
+  color: var(--text-muted);
+  font-size: 12px;
+  margin-top: 2px;
+}
+
+/* ------------------------------------------------------------------ layout */
+
+.grid {
+  display: grid;
+  grid-template-columns: 1.35fr 1fr;
+  gap: var(--gap);
+  align-items: start;
+}
+
+@media (max-width: 940px) {
+  .grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+.card h2 {
+  font-size: 14px;
+  font-weight: 650;
+  margin: 0 0 2px;
+}
+
+.card .caption {
+  color: var(--text-secondary);
+  font-size: 12px;
+  margin: 0 0 14px;
+}
+
+/* ------------------------------------------------------------------- chart */
+
+.bar-row {
+  display: grid;
+  grid-template-columns: 128px 1fr auto;
+  align-items: center;
+  gap: 10px;
+  padding: 5px 0;
+}
+
+.bar-row .name {
+  font-size: 12px;
+  color: var(--text-primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.bar-row .specialty {
+  color: var(--text-muted);
+}
+
+.track {
+  background: var(--surface-2);
+  border-radius: 4px;
+  height: 18px;
+  overflow: hidden;
+}
+
+/* 4px rounded data-end, anchored to the baseline (the left edge here). */
+.fill {
+  height: 100%;
+  border-radius: 0 4px 4px 0;
+  background: var(--series-1);
+  transition: width 240ms ease;
+}
+
+.bar-row .count {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-primary);
+  min-width: 30px;
+  text-align: right;
+}
+
+/* ------------------------------------------------------------------- feed */
+
+.feed {
+  max-height: 420px;
+  overflow-y: auto;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.feed li {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  gap: 10px;
+  align-items: baseline;
+  padding: 9px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.feed li:last-child {
+  border-bottom: 0;
+}
+
+.chip {
+  font-size: 11px;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: var(--surface-2);
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+.chip[data-kind="appointment"] {
+  color: #fff;
+  background: var(--series-1);
+}
+.chip[data-kind="patient"] {
+  color: #fff;
+  background: var(--series-3);
+}
+.chip[data-kind="call"] {
+  color: #fff;
+  background: var(--series-2);
+}
+
+.feed .detail {
+  color: var(--text-primary);
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+
+.feed .when {
+  color: var(--text-muted);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.feed .empty,
+.empty-state {
+  color: var(--text-muted);
+  font-size: 13px;
+  padding: 18px 0;
+}
+
+.flash {
+  animation: flash 1.4s ease-out;
+}
+
+@keyframes flash {
+  from {
+    background: color-mix(in srgb, var(--series-1) 18%, transparent);
+  }
+  to {
+    background: transparent;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .flash {
+    animation: none;
+  }
+  .fill {
+    transition: none;
+  }
+}
+
+/* ------------------------------------------------------------------ tables */
+
+.tabs {
+  display: flex;
+  gap: 4px;
+  margin-bottom: 12px;
+  flex-wrap: wrap;
+}
+
+.tab {
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--text-secondary);
+  padding: 5px 11px;
+  border-radius: 7px;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 550;
+  cursor: pointer;
+}
+
+.tab[aria-selected="true"] {
+  background: var(--surface-2);
+  border-color: var(--border);
+  color: var(--text-primary);
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+th {
+  text-align: left;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-secondary);
+  border-bottom: 1px solid var(--border);
+  padding: 8px 10px 8px 0;
+  white-space: nowrap;
+}
+
+td {
+  padding: 9px 10px 9px 0;
+  border-bottom: 1px solid var(--border);
+  color: var(--text-primary);
+}
+
+tr:last-child td {
+  border-bottom: 0;
+}
+
+.error {
+  border-left: 3px solid var(--critical);
+  background: var(--surface-1);
+  padding: 12px 14px;
+  border-radius: 6px;
+  color: var(--text-primary);
+  margin-bottom: var(--gap);
+  font-size: 13px;
+}
