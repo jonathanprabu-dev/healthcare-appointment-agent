@@ -43,6 +43,7 @@ class _ReferenceDatabase:
         self._doctor_records = [
             {
                 "name": "Dr. Henry Jekyll",
+                "specialty": "Cardiology",
                 "accepted_insurances": ["Anthem", "HealthFirst"],
                 "availability": [
                     {"date": today + timedelta(days=2), "time": time(9, 30)},
@@ -52,6 +53,7 @@ class _ReferenceDatabase:
             },
             {
                 "name": "Dr. Edward Hyde",
+                "specialty": "Internal Medicine",
                 "accepted_insurances": ["Anthem", "Aetna", "EmblemHealth"],
                 "availability": [
                     {"date": today + timedelta(days=1), "time": time(10, 0)},
@@ -432,8 +434,8 @@ _claim.close()
 
 print("\nadmin surface")
 _admin = SqliteDatabase(":memory:")
-check("add_doctor", True, _admin.add_doctor("Dr. Ada Chen", ["Anthem"]))
-check("add_doctor rejects a duplicate name", False, _admin.add_doctor("Dr. Ada Chen", ["Aetna"]))
+check("add_doctor", True, _admin.add_doctor("Dr. Ada Chen", "Cardiology", ["Anthem"]))
+check("add_doctor rejects a duplicate name", False, _admin.add_doctor("Dr. Ada Chen", "Cardiology", ["Aetna"]))
 _slots = [(date(2030, 5, 1), time(9, 0)), (date(2030, 5, 1), time(9, 30))]
 check("add_availability", 2, _admin.add_availability("Dr. Ada Chen", _slots))
 check("add_availability skips duplicates", 0, _admin.add_availability("Dr. Ada Chen", _slots))

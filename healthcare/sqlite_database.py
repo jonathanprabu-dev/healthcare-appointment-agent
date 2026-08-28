@@ -56,6 +56,7 @@ CREATE INDEX IF NOT EXISTS idx_appointments_patient ON appointments(patient_id);
 CREATE TABLE IF NOT EXISTS doctors (
     id                  INTEGER PRIMARY KEY,
     name                TEXT NOT NULL UNIQUE,
+    specialty           TEXT NOT NULL,
     accepted_insurances TEXT NOT NULL          -- JSON array
 );
 
@@ -82,6 +83,9 @@ class SqliteDatabase:
         # thread in some paths; access here is serialized by SQLite's own lock.
         self._con = sqlite3.connect(path, check_same_thread=False)
         self._con.row_factory = sqlite3.Row
+        # Optional observer of writes. None (default) means "no dashboard":
+        # every existing test and the plain CLI keep working untouched.
+        self._event_sink = None
         # WAL lets readers run concurrently with a writer — LiveKit runs jobs
         # as threads (Windows) or separate processes (Linux), so several
         # sessions may touch this file at once. WAL is a property of the
@@ -91,13 +95,42 @@ class SqliteDatabase:
         self._con.execute("PRAGMA journal_mode=WAL")
         self._con.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
         self._con.executescript(SCHEMA)
+        self._migrate()
         if seed and not self._con.execute("SELECT 1 FROM patients LIMIT 1").fetchone():
             self._seed()
 
     def close(self) -> None:
         self._con.close()
 
+    def set_event_sink(self, sink) -> None:
+        """Attach an observer of every successful write.
+
+        The sink is called with ``sink(Event)`` where Event is a small
+        ``{"type": str, "payload": dict}`` shape and the payload is fully
+        JSON-serializable (dates/times already ISO-encoded). ``None`` detaches.
+        Anything with that one method is accepted; the dashboard sink in
+        ``dashboard_events.py`` is the intended implementation.
+        """
+        self._event_sink = sink
+
+    def _emit(self, event_type: str, payload: dict) -> None:
+        if self._event_sink is None:
+            return
+        self._event_sink({"type": event_type, "payload": _encode_recursive(payload)})
+
     # ------------------------------------------------------------------ seed
+
+    def _migrate(self) -> None:
+        """Bring a database created by an older schema up to date in place."""
+        current = self._con.execute("PRAGMA table_info(doctors)").fetchall()
+        columns = {row["name"] for row in current}
+        if "specialty" not in columns:
+            # NOT NULL column added to a non-empty table needs a default for
+            # the rows that already exist. Real doctors pre-date the field, so
+            # "General" is the honest catch-all the admin can amend later.
+            self._con.execute(
+                "ALTER TABLE doctors ADD COLUMN specialty TEXT NOT NULL DEFAULT 'General'"
+            )
 
     def _seed(self) -> None:
         today = date.today()
@@ -115,6 +148,7 @@ class SqliteDatabase:
             doctors = (
                 (
                     "Dr. Henry Jekyll",
+                    "Cardiology",
                     ["Anthem", "HealthFirst"],
                     [
                         (today + timedelta(days=2), time(9, 30)),
@@ -124,6 +158,7 @@ class SqliteDatabase:
                 ),
                 (
                     "Dr. Edward Hyde",
+                    "Internal Medicine",
                     ["Anthem", "Aetna", "EmblemHealth"],
                     [
                         (today + timedelta(days=1), time(10, 0)),
@@ -132,10 +167,11 @@ class SqliteDatabase:
                     ],
                 ),
             )
-            for name, insurances, slots in doctors:
+            for name, specialty, insurances, slots in doctors:
                 cur = self._con.execute(
-                    "INSERT INTO doctors (name, accepted_insurances) VALUES (?, ?)",
-                    (name, json.dumps(insurances)),
+                    "INSERT INTO doctors (name, specialty, accepted_insurances)"
+                    " VALUES (?, ?, ?)",
+                    (name, specialty, json.dumps(insurances)),
                 )
                 self._con.executemany(
                     "INSERT INTO availability (doctor_id, date, time) VALUES (?, ?, ?)",
@@ -172,6 +208,7 @@ class SqliteDatabase:
     def _doctor(self, row: sqlite3.Row) -> dict:
         return {
             "name": row["name"],
+            "specialty": row["specialty"],
             "accepted_insurances": json.loads(row["accepted_insurances"]),
             "availability": [
                 {
@@ -215,9 +252,19 @@ class SqliteDatabase:
         row = self._con.execute("SELECT * FROM doctors WHERE name = ?", (name,)).fetchone()
         return self._doctor(row) if row else None
 
-    def get_compatible_doctors(self, insurance: str) -> list:
+    def get_compatible_doctors(self, insurance: str, specialty: str | None = None) -> list:
+        """Doctors a patient with that insurance could see.
+
+        ``specialty`` narrows the list further — the agent infers one from the
+        caller's stated visit reason. ``None`` keeps the historic
+        insurance-only behaviour, so every existing call site and test is
+        unchanged.
+        """
         return [
-            doctor for doctor in self.doctor_records if insurance in doctor["accepted_insurances"]
+            doctor
+            for doctor in self.doctor_records
+            if insurance in doctor["accepted_insurances"]
+            and (specialty is None or doctor["specialty"] == specialty)
         ]
 
     def get_outstanding_balance(self, name: str) -> float | None:
@@ -248,7 +295,13 @@ class SqliteDatabase:
                 f"UPDATE patients SET {assignments} WHERE name = ?",
                 (*values, patient_name),
             )
-        return cur.rowcount > 0
+            updated = cur.rowcount > 0
+        if updated:
+            self._emit(
+                "patient.updated",
+                {"name": patient_name, "fields": fields, "patient": self.get_patient_by_name(patient_name)},
+            )
+        return updated
 
     def add_patient_record(self, info: dict) -> None:
         # Mutates `info` in place: agent.py keeps a reference to this dict as
@@ -266,17 +319,20 @@ class SqliteDatabase:
                     info["outstanding_balance"],
                 ),
             )
+        self._emit("patient.created", {"patient": info})
 
-    def add_doctor(self, name: str, accepted_insurances: list[str]) -> bool:
+    def add_doctor(self, name: str, specialty: str, accepted_insurances: list[str]) -> bool:
         """Register a doctor. False if that name is already taken."""
         try:
             with self._con:
                 self._con.execute(
-                    "INSERT INTO doctors (name, accepted_insurances) VALUES (?, ?)",
-                    (name, json.dumps(list(accepted_insurances))),
+                    "INSERT INTO doctors (name, specialty, accepted_insurances)"
+                    " VALUES (?, ?, ?)",
+                    (name, specialty, json.dumps(list(accepted_insurances))),
                 )
         except sqlite3.IntegrityError:
             return False
+        self._emit("doctor.created", {"doctor": {"name": name, "specialty": specialty, "accepted_insurances": list(accepted_insurances)}})
         return True
 
     def add_availability(self, doctor_name: str, slots: list[tuple[date, time]]) -> int:
@@ -295,7 +351,12 @@ class SqliteDatabase:
                 "INSERT OR IGNORE INTO availability (doctor_id, date, time) VALUES (?, ?, ?)",
                 [(row["id"], d.isoformat(), t.isoformat()) for d, t in slots],
             )
-        return cur.rowcount
+        added = cur.rowcount
+        if added:
+            self._emit(
+                "doctor.availability_added", {"doctor_name": doctor_name, "added": added}
+            )
+        return added
 
     def booked_times(self, doctor_name: str) -> set[datetime]:
         """Times this doctor is already booked for — availability has no row."""
@@ -357,6 +418,15 @@ class SqliteDatabase:
                     appointment.get("visit_reason"),
                 ),
             )
+        self._emit(
+            "appointment.scheduled",
+            {
+                "patient_name": name,
+                "doctor_name": appointment["doctor_name"],
+                "appointment_time": appt_time,
+                "visit_reason": appointment.get("visit_reason"),
+            },
+        )
         return True
 
     def cancel_appointment(self, name: str, appointment: dict) -> bool:
@@ -386,6 +456,15 @@ class SqliteDatabase:
                     " VALUES (?, ?, ?)",
                     (doctor["id"], appt_time.date().isoformat(), appt_time.time().isoformat()),
                 )
+        self._emit(
+            "appointment.cancelled",
+            {
+                "patient_name": name,
+                "doctor_name": appointment["doctor_name"],
+                "appointment_time": appt_time,
+                "visit_reason": appointment.get("visit_reason"),
+            },
+        )
         return True
 
     def apply_payment(self, name: str, amount: float) -> float | None:
@@ -396,7 +475,13 @@ class SqliteDatabase:
                 " RETURNING outstanding_balance",
                 (amount, name),
             ).fetchone()
-        return row["outstanding_balance"] if row else None
+        balance = row["outstanding_balance"] if row else None
+        if balance is not None:
+            self._emit(
+                "payment.processed",
+                {"patient_name": name, "amount": amount, "remaining_balance": balance},
+            )
+        return balance
 
     def remove_doctor_availability(self, doctor_name: str, appointment_time: dict) -> None:
         with self._con:
@@ -416,3 +501,18 @@ def _encode(value: object) -> object:
     if isinstance(value, (date, datetime, time)):
         return value.isoformat()
     return value
+
+
+def _encode_recursive(value: object) -> object:
+    """JSON-safe copy of a nested structure of dicts/lists/scalars.
+
+    Event payloads are stamped with real ``date``/``time``/``datetime`` objects
+    from the return values of the mutating methods; this serializes them the
+    same way ``_encode`` does, but at any depth. Non-serializable leftovers
+    (rows, handles, ...) are stringified rather than raised on.
+    """
+    if isinstance(value, dict):
+        return {k: _encode_recursive(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_encode_recursive(v) for v in value]
+    return _encode(value)
