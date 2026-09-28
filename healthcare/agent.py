@@ -480,13 +480,20 @@ class ScheduleAppointmentTask(AgentTask[ScheduleAppointmentResult]):
             current_tools = [t for t in self.tools if t.id != "confirm_specialty"]
             current_tools.append(specialty_tool)
             await self.update_tools(current_tools)
+            # tool_choice must be forced here. `generate_reply` defaults it to "none"
+            # whenever it is called from inside a function_tool (agent_activity.py),
+            # and these instructions ask for a tool call and nothing spoken -- so the
+            # model's `confirm_specialty` is dropped and there is nothing to
+            # synthesize. A real caller sat through 34s of dead air before
+            # prompting with "Hello?".
             await self.session.generate_reply(
+                tool_choice="auto",
                 instructions=(
                     "Map the user's stated reason for visiting to the closest medical "
                     "specialty and call 'confirm_specialty' with it. Only pick a specialty "
                     "on the list. If the user has not said what kind of care they need, ask "
                     "for the reason for the visit before calling it."
-                )
+                ),
             )
 
         return confirm_visit_reason
@@ -641,8 +648,12 @@ class ModifyAppointmentTask(AgentTask[ModifyAppointmentResult]):
                 content=f"The user has these outstanding appointments: {json.dumps(appointments, default=str)} and requested to {self._function} one.",
             )
             await self.update_chat_ctx(chat_ctx)
+            # Same reason as the specialty hop above: these instructions name a tool.
+            # This path still asks for speech, so a dropped call costs a turn rather
+            # than the whole call -- forced anyway so it cannot regress into silence.
             await self.session.generate_reply(
-                instructions="Prompt the user to choose one of the appointments to modify, and confirm if they would either like to reschedule or cancel it. Avoid using special notations. Call 'confirm_appointment_selection' to carry out the execution."
+                tool_choice="auto",
+                instructions="Prompt the user to choose one of the appointments to modify, and confirm if they would either like to reschedule or cancel it. Avoid using special notations. Call 'confirm_appointment_selection' to carry out the execution.",
             )
 
     def _build_modify_appt_tool(self, *, available_appts: list[dict]) -> FunctionTool:
@@ -1111,7 +1122,15 @@ async def entrypoint(ctx: JobContext):
     # The player publishes a track; close it with the job so it does not leak.
     ctx.add_shutdown_callback(background_audio.aclose)
     # Flush whatever dashboard events are still queued when the job ends.
-    ctx.add_shutdown_callback(events.close)
+    # `events.close` is sync, and the job runner does `await callback()` -- awaiting
+    # None raises TypeError, which aborts the gather() over shutdown callbacks and
+    # abandons `background_audio.aclose` alongside it ("Task was destroyed but it is
+    # pending"). to_thread rather than a bare async shim because close() joins its
+    # worker thread and must not block the loop during shutdown.
+    async def flush_dashboard_events() -> None:
+        await asyncio.to_thread(events.close)
+
+    ctx.add_shutdown_callback(flush_dashboard_events)
 
 
 if __name__ == "__main__":
