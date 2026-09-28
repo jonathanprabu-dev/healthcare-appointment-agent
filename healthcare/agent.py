@@ -11,6 +11,7 @@ from dotenv import load_dotenv
 from pydantic import Field
 from sqlite_database import SqliteDatabase
 
+from livekit import rtc
 from livekit.agents import (
     Agent,
     AgentServer,
@@ -21,6 +22,7 @@ from livekit.agents import (
     BuiltinAudioClip,
     FunctionTool,
     JobContext,
+    JobProcess,
     RunContext,
     cli,
     inference,
@@ -738,6 +740,27 @@ class HealthcareAgent(Agent):
 
     async def on_enter(self) -> None:
         logger.info("on_enter: requesting greeting")
+
+        # TEMP diagnostic: the greeting intermittently never returns. If it is still
+        # pending after 15s, dump every asyncio task's stack to name the stuck await.
+        async def _greeting_watchdog() -> None:
+            await asyncio.sleep(15)
+            import io
+
+            buf = io.StringIO()
+            for t in asyncio.all_tasks():
+                buf.write(f"\n--- {t.get_name()} ---\n")
+                t.print_stack(file=buf)
+            logger.warning("GREETING_WATCHDOG: greeting still pending after 15s%s", buf.getvalue())
+
+        watchdog = asyncio.create_task(_greeting_watchdog())
+        try:
+            await self._greet()
+        finally:
+            watchdog.cancel()
+        logger.info("on_enter: greeting finished")
+
+    async def _greet(self) -> None:
         await self.session.generate_reply(
             instructions=(
                 "Warmly welcome the user to the healthcare clinic and ask how you can help "
@@ -745,7 +768,6 @@ class HealthcareAgent(Agent):
                 "Then gather the reason for their call."
             )
         )
-        logger.info("on_enter: greeting finished")
 
     async def task_completed_callback(self, event, task_group):
         if event.task_id == "get_name_task":
@@ -990,10 +1012,31 @@ class HealthcareAgent(Agent):
         return confirm_payment_proceeds
 
 
-server = AgentServer()
+def prewarm(proc: JobProcess) -> None:
+    """Initialize soxr's FFT cache before any call audio flows.
+
+    The soxr resampler bundled in livekit_ffi.dll sets up a global FFT cache on
+    first use, with no lock (it is built without OpenMP, so its ccrw2 locks are
+    no-ops). When the STT resampler and another audio path hit that first use
+    at the same moment, `assert(FFT_LEN == -1)` fails in fft4g_cache.h: on
+    Windows the job thread blocks on a "Visual C++ Runtime Library" dialog (the
+    silent greeting) and the worker later dies with exit code 3. The cache is
+    never torn down, so exercising it once here, single-threaded, closes the race.
+    """
+    for quality in rtc.AudioResamplerQuality:
+        for rate in (8000, 16000, 24000, 44100, 48000):
+            for src, dst in ((rate, 16000), (16000, rate)):
+                resampler = rtc.AudioResampler(src, dst, quality=quality)
+                resampler.push(rtc.AudioFrame.create(src, 1, src // 100))
+                resampler.flush()
 
 
-@server.rtc_session()
+server = AgentServer(setup_fnc=prewarm)
+
+
+# Must match the agent named in the SIP dispatch rule (sip-dispatch-rule.json),
+# or inbound phone calls are never dispatched to this worker.
+@server.rtc_session(agent_name="healthcare-agent")
 async def entrypoint(ctx: JobContext):
     db = SqliteDatabase(CLINIC_DB)
     # Optional dashboard streaming. Reads $DASHBOARD_URL; unset it and every
@@ -1134,4 +1177,9 @@ async def entrypoint(ctx: JobContext):
 
 
 if __name__ == "__main__":
+    # TEMP diagnostic: the worker has died with no traceback; a native fault
+    # (if that is what it is) at least leaves Python stacks on stderr.
+    import faulthandler
+
+    faulthandler.enable()
     cli.run_app(server)
