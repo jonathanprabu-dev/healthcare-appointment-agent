@@ -75,7 +75,8 @@ def prepare_load_fixtures(path: str, rounds: int) -> None:
     with con:
         for worker in range(WORKERS):
             cur = con.execute(
-                "INSERT INTO doctors (name, accepted_insurances) VALUES (?, '[]')",
+                "INSERT INTO doctors (name, specialty, accepted_insurances)"
+                " VALUES (?, 'General', '[]')",
                 (f"Dr. W{worker}",),
             )
             con.executemany(

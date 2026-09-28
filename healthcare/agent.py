@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Annotated
@@ -10,13 +11,18 @@ from dotenv import load_dotenv
 from pydantic import Field
 from sqlite_database import SqliteDatabase
 
+from livekit import rtc
 from livekit.agents import (
     Agent,
     AgentServer,
     AgentSession,
     AgentTask,
+    AudioConfig,
+    BackgroundAudioPlayer,
+    BuiltinAudioClip,
     FunctionTool,
     JobContext,
+    JobProcess,
     RunContext,
     cli,
     inference,
@@ -33,7 +39,14 @@ from livekit.agents.beta.workflows import (
     WarmTransferTask,
 )
 from livekit.agents.llm import ToolError, function_tool
-from livekit.agents.voice import UserStateChangedEvent
+from livekit.agents.voice import (
+    CloseEvent,
+    FunctionToolsExecutedEvent,
+    UserInputTranscribedEvent,
+    UserStateChangedEvent,
+)
+
+from dashboard_events import DashboardEventLog
 
 logger = logging.getLogger("HealthcareAgent")
 
@@ -44,10 +57,49 @@ SIP_TRUNK_ID = os.getenv("LIVEKIT_SIP_OUTBOUND_TRUNK")  # "ST_abcxyz"
 SUPERVISOR_PHONE_NUMBER = os.getenv("LIVEKIT_SUPERVISOR_PHONE_NUMBER")  # "+12003004000"
 SIP_NUMBER = os.getenv("LIVEKIT_SIP_NUMBER")  # "+15005006000" - caller ID shown to supervisor
 
+# How long a spoken subtask may run before the tool call gives up. It has to
+# cover several conversational turns end to end, so it is deliberately generous:
+# it is here to catch a task that is stuck, not one that is merely slow.
+SUBTASK_TIMEOUT_SECONDS = 300
+
+# How many of a doctor's open times the agent names unprompted. It bounds what
+# goes into the chat context and, more to the point, how long the caller sits
+# listening -- a real doctor here has ~180 slots on file.
+SLOT_SHORTLIST = 8
+
 # Path to the clinic database. ":memory:" gives a throwaway per-session store.
 CLINIC_DB = os.getenv("CLINIC_DB", "clinic.db")
 
-VALID_INSURANCES = ["Anthem", "Aetna", "EmblemHealth", "HealthFirst"]
+# The insurances a caller is allowed to state. This has to track what the
+# clinic's doctors actually accept (`admin.py add-doctor --insurances`):
+# anything offered here that no doctor accepts is a dead end, and anything a
+# doctor accepts that is missing here cannot be recorded at all. It was left at
+# the demo-fixture values while real doctors were loaded, which is how a caller
+# reached "HealthFirst" -- accepted at this step, compatible with nobody.
+VALID_INSURANCES = [
+    "Anthem",
+    "Aetna",
+    "Cigna",
+    "Blue Cross",
+    "United Healthcare",
+    "Medicare",
+    "Medicaid",
+]
+
+# The specialties a caller can be routed to, inferred from the reason for the
+# visit. "General" is a general practitioner who accepts anyone. Keep this in
+# sync with `admin.py add-doctor --specialty`.
+SPECIALTIES = [
+    "Cardiology",
+    "Dermatology",
+    "Family Medicine",
+    "Internal Medicine",
+    "Neurology",
+    "Orthopedics",
+    "Pediatrics",
+    "Psychiatry",
+    "General",
+]
 
 GLOBAL_INSTRUCTIONS = "Be succinct and to the point when assisting the user. Never give medical advice or diagnose users, escalate to a human whenever the user's request is out of your scope of assistance."
 
@@ -146,7 +198,10 @@ _GET_INSURANCE_TEXT_SPECIFIC = (
 _SCHEDULE_APPT_BASE_INSTRUCTIONS = (
     "You will now assist the user with selecting a doctor and appointment time.\n"
     "Do not be verbose and ask for any unnecessary information unless instructed to.\n"
-    "You will focus on confirming the doctor the user selects first. Do not ask for appointment times preemptively.\n"
+    "Start by collecting the reason for the user's visit so you can match them to the"
+    " right specialty. Never invent a specialty or a doctor.\n"
+    "Only after the specialty is confirmed do you offer the compatible doctors"
+    " (matched on BOTH their insurance and the specialty), then times.\n"
     "If the user requests to update their insurance, after confirming their new insurance, their compatible doctor(s) may change.\n"
     "In this case, do not prompt for a doctor confirmation until their insurance is fully updated and their compatible doctors are retrieved.\n"
     "{modality_specific}\n" + GLOBAL_INSTRUCTIONS
@@ -279,6 +334,36 @@ def build_update_record(mutable_fields: list[str] | None = None) -> FunctionTool
     return update_record
 
 
+def _format_slot(slot: dict) -> str:
+    """One availability row as something an LLM can read aloud."""
+    dt = datetime.combine(slot["date"], slot["time"])
+    hour = dt.hour % 12 or 12
+    meridiem = "AM" if dt.hour < 12 else "PM"
+    return f"{dt:%a %b} {dt.day} at {hour}:{dt.minute:02d} {meridiem}"
+
+
+def _describe_slots(slots: list[dict], limit: int = SLOT_SHORTLIST) -> str:
+    """A spoken-length summary of a doctor's availability.
+
+    The whole table used to go into the chat context as Python reprs --
+    12,522 characters for a doctor with a month of slots, and the agent then
+    tried to read every one of them to the caller. Only the earliest few are
+    named here. The `schedule_appointment` enum still carries every slot, so a
+    caller who asks for a later date can still be booked into it; this only
+    governs what the agent volunteers.
+    """
+    if not slots:
+        return "The selected doctor has no open times."
+    shown = "; ".join(_format_slot(slot) for slot in slots[:limit])
+    if len(slots) <= limit:
+        return f"The selected doctor is available at: {shown}."
+    return (
+        f"The selected doctor has {len(slots)} open times, running through "
+        f"{_format_slot(slots[-1])}. The {limit} earliest are: {shown}. Offer these; if the "
+        "caller wants a different day, ask which day and offer times on it."
+    )
+
+
 class ScheduleAppointmentTask(AgentTask[ScheduleAppointmentResult]):
     def __init__(self, chat_ctx: llm.ChatContext | None = None):
         super().__init__(
@@ -302,35 +387,61 @@ class ScheduleAppointmentTask(AgentTask[ScheduleAppointmentResult]):
         )
         self._selected_doctor: str | None = None
         self._appointment_time: datetime | None = None
+        self._visit_reason: str | None = None
+        self._specialty: str | None = None
 
     async def _setup_doctor_selection(self):
         database = self.session.userdata.database
         insurance = self.session.userdata.profile["insurance"]
-        self._compatible_doctor_records = database.get_compatible_doctors(insurance=insurance)
-        available_doctors = [doctor["name"] for doctor in self._compatible_doctor_records]
-        doctor_confirmation_tool = self._build_doctor_selection_tool(
-            available_doctors=available_doctors
+        specialty = self._specialty
+        self._compatible_doctor_records = database.get_compatible_doctors(
+            insurance=insurance, specialty=specialty
         )
+        available_doctors = [doctor["name"] for doctor in self._compatible_doctor_records]
         current_tools = [t for t in self.tools if t.id != "confirm_doctor_selection"]
-        current_tools.append(doctor_confirmation_tool)
+        if available_doctors:
+            current_tools.append(
+                self._build_doctor_selection_tool(available_doctors=available_doctors)
+            )
+            content = (
+                f"These doctors accept the user's insurance ({insurance})"
+                + (
+                    f" AND provide {specialty} care"
+                    if specialty is not None
+                    else ""
+                )
+                + f": {available_doctors}"
+            )
+        else:
+            # Registering the tool anyway would give it an empty enum -- no value
+            # the model is allowed to emit. On a real call that did not fail
+            # loudly: the completion request timed out and retried indefinitely,
+            # and because this task only finishes by way of
+            # confirm_doctor_selection, the caller heard nothing at all until
+            # SUBTASK_TIMEOUT_SECONDS. Leave the tool off and say what is true.
+            content = (
+                f"No doctors in the network accept the user's insurance "
+                f"({insurance})"
+                + (
+                    f" AND provide {specialty} care"
+                    if specialty is not None
+                    else ""
+                )
+                + ". There is no doctor to choose."
+            )
         await self.update_tools(current_tools)
         chat_ctx = self.chat_ctx.copy()
-        chat_ctx.add_message(
-            role="system",
-            content=f"These doctors are now compatible with the user's insurance: {available_doctors}",
-        )
+        chat_ctx.add_message(role="system", content=content)
         await self.update_chat_ctx(chat_ctx)
 
     async def on_enter(self):
-        await self._setup_doctor_selection()
-        if len(self._compatible_doctor_records) > 1:
-            await self.session.generate_reply(
-                instructions="Inform the user of the doctors compatible to them, and prompt the user to choose one. Avoid special notation when listing out the doctors."
-            )
-        else:
-            await self.session.generate_reply(
-                instructions="Inform the user of their compatible doctor and confirm if they would like to select that doctor. Avoid special notation when listing out the doctors.."
-            )
+        visit_reason_tool = self._build_visit_reason_tool()
+        current_tools = [t for t in self.tools if t.id != "confirm_visit_reason"]
+        current_tools.append(visit_reason_tool)
+        await self.update_tools(current_tools)
+        await self.session.generate_reply(
+            instructions="Prompt the user for the reason for their visit, so you can match them to the right specialty and doctor."
+        )
 
     @function_tool()
     async def update_insurance(self, context: RunContext, updated_insurance: str):
@@ -357,6 +468,68 @@ class ScheduleAppointmentTask(AgentTask[ScheduleAppointmentResult]):
         await self._setup_doctor_selection()
         available_doctors = [doctor["name"] for doctor in self._compatible_doctor_records]
         return f"The insurance has been updated. The new compatible doctors are: {available_doctors}. Prompt the user to choose from these doctors."
+
+    def _build_visit_reason_tool(self) -> FunctionTool:
+        @function_tool()
+        async def confirm_visit_reason(visit_reason: str):
+            """Call to record the user's reason for their appointment.
+
+            Args:
+                visit_reason (str): The user's reason for visiting a doctor
+            """
+            self._visit_reason = visit_reason
+            specialty_tool = self._build_specialty_tool()
+            current_tools = [t for t in self.tools if t.id != "confirm_specialty"]
+            current_tools.append(specialty_tool)
+            await self.update_tools(current_tools)
+            # tool_choice must be forced here. `generate_reply` defaults it to "none"
+            # whenever it is called from inside a function_tool (agent_activity.py),
+            # and these instructions ask for a tool call and nothing spoken -- so the
+            # model's `confirm_specialty` is dropped and there is nothing to
+            # synthesize. A real caller sat through 34s of dead air before
+            # prompting with "Hello?".
+            await self.session.generate_reply(
+                tool_choice="auto",
+                instructions=(
+                    "Map the user's stated reason for visiting to the closest medical "
+                    "specialty and call 'confirm_specialty' with it. Only pick a specialty "
+                    "on the list. If the user has not said what kind of care they need, ask "
+                    "for the reason for the visit before calling it."
+                ),
+            )
+
+        return confirm_visit_reason
+
+    def _build_specialty_tool(self) -> FunctionTool:
+        @function_tool()
+        async def confirm_specialty(
+            specialty: Annotated[
+                str,
+                Field(
+                    description="The medical specialty matching the user's visit reason",
+                    json_schema_extra={"enum": SPECIALTIES},
+                ),
+            ],
+        ) -> None:
+            """Call to confirm the specialty that matches the user's stated visit reason."""
+            self._specialty = specialty
+            await self._setup_doctor_selection()
+            if not self._compatible_doctor_records:
+                # Nothing here can be booked. Both exits are already tools on this
+                # task, so hand the caller to them instead of stalling.
+                await self.session.generate_reply(
+                    instructions="Apologize and tell the user that no doctors in the network accept their insurance and provide their needed specialty. Ask whether they have a different insurance you could check, and offer to transfer them to a human agent otherwise. Do not name or invent a doctor."
+                )
+            elif len(self._compatible_doctor_records) > 1:
+                await self.session.generate_reply(
+                    instructions="Inform the user of the doctors compatible to them (matched on both their insurance and specialty), and prompt the user to choose one. Avoid special notation when listing out the doctors."
+                )
+            else:
+                await self.session.generate_reply(
+                    instructions="Inform the user of their compatible doctor and confirm if they would like to select that doctor. Avoid special notation when listing out the doctors."
+                )
+
+        return confirm_specialty
 
     def _build_doctor_selection_tool(self, *, available_doctors: list[str]) -> FunctionTool | None:
         @function_tool()
@@ -386,13 +559,10 @@ class ScheduleAppointmentTask(AgentTask[ScheduleAppointmentResult]):
             await self.update_tools(current_tools)
 
             chat_ctx = self.chat_ctx.copy()
-            chat_ctx.add_message(
-                role="system",
-                content=f"The selected doctor has availabilities at {available_times}.",
-            )
+            chat_ctx.add_message(role="system", content=_describe_slots(available_times))
             await self.update_chat_ctx(chat_ctx)
             await self.session.generate_reply(
-                instructions="Inform and ask the user which time slot they prefer, and do not list out the times using bullet points. Avoid special notation when listing out the available time slots."
+                instructions="Offer the earliest few times you were given and ask which the user prefers. Name at most three or four out loud -- do not read the whole list, and do not use bullet points or special notation."
             )
 
         return confirm_doctor_selection
@@ -420,34 +590,15 @@ class ScheduleAppointmentTask(AgentTask[ScheduleAppointmentResult]):
                 appointment_time (str): The user's appointment time selection in ISO format
             """
             self._appointment_time = datetime.fromisoformat(appointment_time)
-
-            visit_reason_tool = self._build_visit_reason_tool()
-            current_tools = [t for t in self.tools if t.id != "confirm_visit_reason"]
-            current_tools.append(visit_reason_tool)
-            await self.update_tools(current_tools)
-            await self.session.generate_reply(
-                instructions="Prompt the user for the reason for their visit."
-            )
-
-        return schedule_appointment
-
-    def _build_visit_reason_tool(self) -> FunctionTool:
-        @function_tool()
-        async def confirm_visit_reason(visit_reason: str):
-            """Call to record the user's reason for their appointment.
-
-            Args:
-                visit_reason (str): The user's reason for visiting a doctor
-            """
             self.complete(
                 ScheduleAppointmentResult(
                     doctor_name=self._selected_doctor,
                     appointment_time=self._appointment_time,
-                    visit_reason=visit_reason,
+                    visit_reason=self._visit_reason,
                 )
             )
 
-        return confirm_visit_reason
+        return schedule_appointment
 
 
 class ModifyAppointmentTask(AgentTask[ModifyAppointmentResult]):
@@ -499,8 +650,12 @@ class ModifyAppointmentTask(AgentTask[ModifyAppointmentResult]):
                 content=f"The user has these outstanding appointments: {json.dumps(appointments, default=str)} and requested to {self._function} one.",
             )
             await self.update_chat_ctx(chat_ctx)
+            # Same reason as the specialty hop above: these instructions name a tool.
+            # This path still asks for speech, so a dropped call costs a turn rather
+            # than the whole call -- forced anyway so it cannot regress into silence.
             await self.session.generate_reply(
-                instructions="Prompt the user to choose one of the appointments to modify, and confirm if they would either like to reschedule or cancel it. Avoid using special notations. Call 'confirm_appointment_selection' to carry out the execution."
+                tool_choice="auto",
+                instructions="Prompt the user to choose one of the appointments to modify, and confirm if they would either like to reschedule or cancel it. Avoid using special notations. Call 'confirm_appointment_selection' to carry out the execution.",
             )
 
     def _build_modify_appt_tool(self, *, available_appts: list[dict]) -> FunctionTool:
@@ -535,7 +690,24 @@ class ModifyAppointmentTask(AgentTask[ModifyAppointmentResult]):
                 )
             else:
                 chat_ctx = await self.chat_ctx.copy()._summarize(self.session.llm)
-                result = await ScheduleAppointmentTask(chat_ctx=chat_ctx)
+                try:
+                    result = await asyncio.wait_for(
+                        ScheduleAppointmentTask(chat_ctx=chat_ctx), SUBTASK_TIMEOUT_SECONDS
+                    )
+                except asyncio.TimeoutError:
+                    # The old appointment is already cancelled at this point, so
+                    # the caller must not be left thinking they still have it.
+                    logger.warning(
+                        "rescheduling timed out after %ss; %s no longer holds %s",
+                        SUBTASK_TIMEOUT_SECONDS,
+                        self._patient_profile["name"],
+                        appointment,
+                    )
+                    raise ToolError(
+                        "Rebooking did not finish, and the original appointment has already "
+                        "been cancelled. Apologize, tell the user their old appointment is no "
+                        "longer held, and offer to book a new time now."
+                    ) from None
                 self.complete(
                     ModifyAppointmentResult(new_appointment=result, old_appointment=appointment)
                 )
@@ -567,6 +739,7 @@ class HealthcareAgent(Agent):
         self._database = database
 
     async def on_enter(self) -> None:
+        logger.info("on_enter: requesting greeting")
         await self.session.generate_reply(
             instructions=(
                 "Warmly welcome the user to the healthcare clinic and ask how you can help "
@@ -574,6 +747,7 @@ class HealthcareAgent(Agent):
                 "Then gather the reason for their call."
             )
         )
+        logger.info("on_enter: greeting finished")
 
     async def task_completed_callback(self, event, task_group):
         if event.task_id == "get_name_task":
@@ -595,8 +769,17 @@ class HealthcareAgent(Agent):
         """Creates a TaskGroup that collects user information"""
         logger.info("Authenticating user information")
         if not self.session.userdata.profile:
+            # No chat_ctx on purpose. Passing the parent transcript in put the
+            # answers the agent had already gathered in front of every subtask,
+            # and GetNameTask.on_enter then asks the model to *confirm* the name
+            # rather than collect it -- but `confirm_name` is only registered as
+            # a side effect of `update_name` running. The model called a tool
+            # that did not exist yet, no completion path fired, and this await
+            # never returned. Starting the tasks clean keeps them on the
+            # collect-then-confirm path the framework actually registers tools
+            # for. The cost is re-asking for something the caller may have
+            # volunteered earlier.
             task_group = TaskGroup(
-                chat_ctx=self.chat_ctx,
                 return_exceptions=False,
                 on_task_completed=lambda event: self.task_completed_callback(event, task_group),
             )
@@ -624,7 +807,17 @@ class HealthcareAgent(Agent):
                 description="Gathers the user's insurance",
             )
             try:
-                results = await task_group
+                results = await asyncio.wait_for(task_group, SUBTASK_TIMEOUT_SECONDS)
+            except asyncio.TimeoutError:
+                # A subtask completes only when the model calls one of its tools.
+                # If it never does, this await is otherwise unbounded -- the
+                # caller just hears silence. Fail the tool call instead so the
+                # agent can apologize and the caller can try again.
+                logger.warning("profile authentication timed out after %ss", SUBTASK_TIMEOUT_SECONDS)
+                raise ToolError(
+                    "Collecting the caller's details did not finish. Apologize for the "
+                    "trouble, and ask whether they would like to try booking again."
+                ) from None
             except ProfileFound:
                 await self.session.generate_reply(
                     instructions="Inform the user that an existing profile has been found with their details."
@@ -648,7 +841,16 @@ class HealthcareAgent(Agent):
     async def schedule_appointment(self):
         """Call to schedule an appointment for the user. Do not ask for any information in advance."""
         await self.profile_authenticator()
-        result = await ScheduleAppointmentTask(chat_ctx=self.chat_ctx)
+        try:
+            result = await asyncio.wait_for(
+                ScheduleAppointmentTask(chat_ctx=self.chat_ctx), SUBTASK_TIMEOUT_SECONDS
+            )
+        except asyncio.TimeoutError:
+            logger.warning("appointment scheduling timed out after %ss", SUBTASK_TIMEOUT_SECONDS)
+            raise ToolError(
+                "Choosing a doctor and time did not finish. Apologize for the trouble, "
+                "and ask whether they would like to try booking again."
+            ) from None
 
         appointment = {
             "doctor_name": result.doctor_name,
@@ -719,8 +921,26 @@ class HealthcareAgent(Agent):
     @function_tool()
     async def retrieve_available_doctors(self) -> None:
         """Call if the user inquires about the available doctors in the network"""
+        # Name, insurances and a sense of availability -- nothing else. Passing
+        # the raw records put every open slot for every doctor into a single
+        # reply instruction: 345 slots and ~5,900 tokens against real data, on
+        # a question as ordinary as "which doctors do you have?".
+        summary = [
+            {
+                "name": doctor["name"],
+                "specialty": doctor["specialty"],
+                "accepted_insurances": doctor["accepted_insurances"],
+                "open_times": len(doctor["availability"]),
+                "next_available": (
+                    _format_slot(doctor["availability"][0])
+                    if doctor["availability"]
+                    else "no open times"
+                ),
+            }
+            for doctor in self._database.doctor_records
+        ]
         await self.session.generate_reply(
-            instructions=f"Inform the user about each doctor record: {self._database.doctor_records}"
+            instructions=f"Inform the user about each doctor: {summary}"
         )
 
     @function_tool()
@@ -772,12 +992,38 @@ class HealthcareAgent(Agent):
         return confirm_payment_proceeds
 
 
-server = AgentServer()
+def prewarm(proc: JobProcess) -> None:
+    """Initialize soxr's FFT cache before any call audio flows.
+
+    The soxr resampler bundled in livekit_ffi.dll sets up a global FFT cache on
+    first use, with no lock (it is built without OpenMP, so its ccrw2 locks are
+    no-ops). When the STT resampler and another audio path hit that first use
+    at the same moment, `assert(FFT_LEN == -1)` fails in fft4g_cache.h: on
+    Windows the job thread blocks on a "Visual C++ Runtime Library" dialog (the
+    silent greeting) and the worker later dies with exit code 3. The cache is
+    never torn down, so exercising it once here, single-threaded, closes the race.
+    """
+    for quality in rtc.AudioResamplerQuality:
+        for rate in (8000, 16000, 24000, 44100, 48000):
+            for src, dst in ((rate, 16000), (16000, rate)):
+                resampler = rtc.AudioResampler(src, dst, quality=quality)
+                resampler.push(rtc.AudioFrame.create(src, 1, src // 100))
+                resampler.flush()
 
 
-@server.rtc_session()
+server = AgentServer(setup_fnc=prewarm)
+
+
+# Must match the agent named in the SIP dispatch rule (sip-dispatch-rule.json),
+# or inbound phone calls are never dispatched to this worker.
+@server.rtc_session(agent_name="healthcare-agent")
 async def entrypoint(ctx: JobContext):
     db = SqliteDatabase(CLINIC_DB)
+    # Optional dashboard streaming. Reads $DASHBOARD_URL; unset it and every
+    # event hook below is a no-op — the agent behaves exactly as before.
+    events = DashboardEventLog()
+    db.set_event_sink(events.post)
+
     userdata = UserData(database=db, profile=None)
     session = AgentSession(
         userdata=userdata,
@@ -787,6 +1033,14 @@ async def entrypoint(ctx: JobContext):
             "inworld/inworld-tts-2",
             voice="Luna",
             extra_kwargs={"delivery_mode": "CREATIVE", "speaking_rate": 1.1},
+            # A real caller got 4m34s of silence when synthesis stalled: the
+            # agent had answered, asked for the greeting, and simply waited --
+            # the configured 10s timeout never fired, and nothing told the
+            # caller anything was wrong. These run server-side in LiveKit
+            # Inference, so a provider outage is switched away from there
+            # rather than here. The caller may hear the voice change mid-call;
+            # that is the intended trade against dead air.
+            fallback=["cartesia/sonic-2", "elevenlabs/eleven_flash_v2_5"],
         ),
         preemptive_generation=True,
         # Flip user_state to "away" after 10s of mutual silence so we can
@@ -795,6 +1049,54 @@ async def entrypoint(ctx: JobContext):
     )
 
     idle_task: asyncio.Task[None] | None = None
+
+    call_started_at = time.monotonic()
+    call_room_name = ctx.room.name
+
+    events.post({"type": "call.started", "payload": {"room": call_room_name}})
+
+    @session.on("user_input_transcribed")
+    def _on_user_transcribed(ev: UserInputTranscribedEvent) -> None:
+        # Live feed: what the caller is saying, as the agent hears it.
+        events.post(
+            {
+                "type": "call.utterance",
+                "payload": {
+                    "room": call_room_name,
+                    "transcript": ev.transcript,
+                    "is_final": ev.is_final,
+                },
+            }
+        )
+
+    @session.on("function_tools_executed")
+    def _on_tools_executed(ev: FunctionToolsExecutedEvent) -> None:
+        # Live feed: what the agent just did (schedule_appointment,
+        # confirm_payment_proceeds, ...) and its result.
+        for call, output in ev.zipped():
+            events.post(
+                {
+                    "type": "call.activity",
+                    "payload": {
+                        "room": call_room_name,
+                        "tool": call.name,
+                        "output": output.output,
+                    },
+                }
+            )
+
+    @session.on("close")
+    def _on_close(ev: CloseEvent) -> None:
+        events.post(
+            {
+                "type": "call.ended",
+                "payload": {
+                    "room": call_room_name,
+                    "reason": ev.reason,
+                    "duration_seconds": round(time.monotonic() - call_started_at, 1),
+                },
+            }
+        )
 
     async def _nudge_while_idle() -> None:
         # Nudge every 10s until the user speaks again — speaking flips
@@ -816,10 +1118,42 @@ async def entrypoint(ctx: JobContext):
             idle_task.cancel()
             idle_task = None
 
+    # Temporary startup markers: two calls wedged between the SIP stream
+    # attaching and the greeting, with no log line in between to say where.
+    logger.info("entrypoint: starting session")
     await session.start(
         agent=HealthcareAgent(database=db),
         room=ctx.room,
     )
+    logger.info("entrypoint: session started")
+
+    # Soft room tone while the agent is thinking, so the caller hears the line
+    # is alive instead of dead air. It plays only in the "thinking" state --
+    # passing agent_session is what subscribes the player to that transition.
+    # The fades matter: both default to 0, which would snap the clip on and cut
+    # it off on every single turn.
+    background_audio = BackgroundAudioPlayer(
+        thinking_sound=AudioConfig(
+            BuiltinAudioClip.FOREST_AMBIENCE,
+            volume=0.25,
+            fade_in=0.4,
+            fade_out=0.6,
+        ),
+    )
+    await background_audio.start(room=ctx.room, agent_session=session)
+    logger.info("entrypoint: background audio started")
+    # The player publishes a track; close it with the job so it does not leak.
+    ctx.add_shutdown_callback(background_audio.aclose)
+    # Flush whatever dashboard events are still queued when the job ends.
+    # `events.close` is sync, and the job runner does `await callback()` -- awaiting
+    # None raises TypeError, which aborts the gather() over shutdown callbacks and
+    # abandons `background_audio.aclose` alongside it ("Task was destroyed but it is
+    # pending"). to_thread rather than a bare async shim because close() joins its
+    # worker thread and must not block the loop during shutdown.
+    async def flush_dashboard_events() -> None:
+        await asyncio.to_thread(events.close)
+
+    ctx.add_shutdown_callback(flush_dashboard_events)
 
 
 if __name__ == "__main__":

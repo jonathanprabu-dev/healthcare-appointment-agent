@@ -5,7 +5,7 @@ insurances they accept, and the slots they offer have to come from somewhere.
 That somewhere is here.
 
     uv run admin.py --help
-    uv run admin.py add-doctor "Dr. Ada Chen" --insurances Anthem Aetna
+    uv run admin.py add-doctor "Dr. Ada Chen" --specialty Cardiology --insurances Anthem Aetna
     uv run admin.py add-slots "Dr. Ada Chen" --from 2026-09-01 --to 2026-09-30 \
         --times 09:00 09:30 10:00 --weekdays mon tue wed thu fri
     uv run admin.py add-patient "Ada Lovelace" --dob 1990-12-10 \
@@ -28,6 +28,18 @@ from datetime import date, datetime, time, timedelta
 
 from sqlite_database import SqliteDatabase
 
+SPECIALTIES = sorted(
+    {
+        "Cardiology",
+        "Dermatology",
+        "Family Medicine",
+        "Internal Medicine",
+        "Neurology",
+        "Orthopedics",
+        "Pediatrics",
+        "Psychiatry",
+    }
+)
 WEEKDAYS = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
 
 
@@ -57,10 +69,13 @@ def cmd_add_patient(db: SqliteDatabase, args: argparse.Namespace) -> int:
 
 
 def cmd_add_doctor(db: SqliteDatabase, args: argparse.Namespace) -> int:
-    if not db.add_doctor(args.name, args.insurances):
+    if not db.add_doctor(args.name, args.specialty, args.insurances):
         print(f"error: a doctor named {args.name!r} already exists", file=sys.stderr)
         return 1
-    print(f"added doctor {args.name} accepting {', '.join(args.insurances) or '(nothing)'}")
+    print(
+        f"added doctor {args.name} ({args.specialty}) accepting "
+        f"{', '.join(args.insurances) or '(nothing)'}"
+    )
     return 0
 
 
@@ -116,7 +131,8 @@ def cmd_list_doctors(db: SqliteDatabase, _args: argparse.Namespace) -> int:
         if availability:
             window = f"  {availability[0]['date']} .. {availability[-1]['date']}"
         print(
-            f"{record['name']:<24} {', '.join(record['accepted_insurances']) or '-':<34}"
+            f"{record['name']:<24} {record['specialty']:<18}"
+            f" {', '.join(record['accepted_insurances']) or '-':<34}"
             f" {len(availability):>4} open{window}"
         )
     return 0
@@ -163,6 +179,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("add-doctor", help="register a doctor")
     p.add_argument("name")
+    p.add_argument(
+        "--specialty", choices=SPECIALTIES, required=True, help=f"choose from {', '.join(SPECIALTIES)}"
+    )
     p.add_argument("--insurances", nargs="*", default=[], metavar="NAME")
     p.set_defaults(func=cmd_add_doctor)
 
