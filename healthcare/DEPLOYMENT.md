@@ -85,16 +85,23 @@ set -a && . ./.env && set +a
 lk sip dispatch create sip-dispatch-rule.json
 ```
 
-Because the rule names an agent, the worker must run under that name —
-no code change needed:
+Because the rule names an agent, the worker must register under that name.
+It does so in code, with `@server.rtc_session(agent_name="healthcare-agent")`
+in `agent.py`, so a plain start is enough:
 
 ```bash
-LIVEKIT_AGENT_NAME=healthcare-agent CLINIC_DB=clinic.db uv run agent.py dev
+CLINIC_DB=clinic.db uv run agent.py dev
+# INFO livekit.agents - registered worker {"agent_name": "healthcare-agent", ...}
 ```
 
-Note the tradeoff: naming the agent switches it to **explicit dispatch**, so it
-stops picking up rooms automatically. Leave `LIVEKIT_AGENT_NAME` unset for
-browser/playground testing.
+Earlier revisions of this file said to set `LIVEKIT_AGENT_NAME` instead.
+LiveKit Agents 1.7 reads no such variable: the worker registered with
+`"agent_name": ""`, and phone calls rang with nobody to answer
+(verified 2026-09-28).
+
+Note the tradeoff: a named agent uses **explicit dispatch**, so it stops
+picking up rooms automatically. To reach it from the browser playground, the
+room must request `healthcare-agent` by name.
 
 **No explicit number-to-rule assignment is needed, and attempting one fails.**
 `sip-dispatch-rule.json` sets neither a trunk nor an inbound number, so
@@ -139,12 +146,12 @@ What *is* verified is the code side — these environment variables are read by
 
 | Variable | Read at | Purpose |
 |---|---|---|
-| `LIVEKIT_SIP_OUTBOUND_TRUNK` | `agent.py:43` | trunk used to dial the supervisor |
-| `LIVEKIT_SUPERVISOR_PHONE_NUMBER` | `agent.py:44` | who a warm transfer reaches |
-| `LIVEKIT_SIP_NUMBER` | `agent.py:45` | caller ID shown to the supervisor |
+| `LIVEKIT_SIP_OUTBOUND_TRUNK` | `SIP_TRUNK_ID` in `agent.py` | trunk used to dial the supervisor |
+| `LIVEKIT_SUPERVISOR_PHONE_NUMBER` | `SUPERVISOR_PHONE_NUMBER` in `agent.py` | who a warm transfer reaches |
+| `LIVEKIT_SIP_NUMBER` | `SIP_NUMBER` in `agent.py` | caller ID shown to the supervisor |
 
 Unset, `transfer_to_human` fails cleanly rather than crashing: the tool raises
-`SIP_TRUNK_ID is not configured` (`agent.py:107`) and the agent apologises to
+`SIP_TRUNK_ID is not configured` (in `transfer_to_human`) and the agent apologises to
 the caller. That path **is** verified — `driver.py --scenario transfer` walks it
 end to end.
 
