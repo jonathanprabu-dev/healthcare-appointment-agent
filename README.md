@@ -140,8 +140,6 @@ Still open:
 - **Slow shutdown:** about 10 seconds after every call, logged as `job shutdown
   is taking too much time`. The likely cause is the background ambience
   player. The caller doesn't hear it.
-- **Temporary diagnostics:** `agent.py` still has a greeting watchdog and
-  `faulthandler.enable()` from the silent-greeting investigation.
 
 ### Windows notes
 

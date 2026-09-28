@@ -740,27 +740,6 @@ class HealthcareAgent(Agent):
 
     async def on_enter(self) -> None:
         logger.info("on_enter: requesting greeting")
-
-        # TEMP diagnostic: the greeting intermittently never returns. If it is still
-        # pending after 15s, dump every asyncio task's stack to name the stuck await.
-        async def _greeting_watchdog() -> None:
-            await asyncio.sleep(15)
-            import io
-
-            buf = io.StringIO()
-            for t in asyncio.all_tasks():
-                buf.write(f"\n--- {t.get_name()} ---\n")
-                t.print_stack(file=buf)
-            logger.warning("GREETING_WATCHDOG: greeting still pending after 15s%s", buf.getvalue())
-
-        watchdog = asyncio.create_task(_greeting_watchdog())
-        try:
-            await self._greet()
-        finally:
-            watchdog.cancel()
-        logger.info("on_enter: greeting finished")
-
-    async def _greet(self) -> None:
         await self.session.generate_reply(
             instructions=(
                 "Warmly welcome the user to the healthcare clinic and ask how you can help "
@@ -768,6 +747,7 @@ class HealthcareAgent(Agent):
                 "Then gather the reason for their call."
             )
         )
+        logger.info("on_enter: greeting finished")
 
     async def task_completed_callback(self, event, task_group):
         if event.task_id == "get_name_task":
@@ -1177,9 +1157,4 @@ async def entrypoint(ctx: JobContext):
 
 
 if __name__ == "__main__":
-    # TEMP diagnostic: the worker has died with no traceback; a native fault
-    # (if that is what it is) at least leaves Python stacks on stderr.
-    import faulthandler
-
-    faulthandler.enable()
     cli.run_app(server)
